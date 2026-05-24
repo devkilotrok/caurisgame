@@ -1528,11 +1528,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       final roomId = gameSession.roomId;
       if (roomId == null || roomId.isEmpty) return null;
 
-      // ✅ Utiliser currentRound mais s'assurer qu'il est au moins 1
-      // Si currentRound est 0, utiliser 1 (premier round)
-      final roundNumber = (gameSession.currentRound > 0 
-          ? gameSession.currentRound 
-          : 1).clamp(1, 13);
+      final roundNumber = _effectiveRoundNumber();
       final trickNumber = (cardManager.currentTrickNumber > 0 
           ? cardManager.currentTrickNumber 
           : 1).clamp(1, 13);
@@ -1561,7 +1557,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       final roomId = gameSession.roomId;
       if (roomId == null || roomId.isEmpty) return null;
 
-      final roundNumber = gameSession.currentRound;
+      final roundNumber = _effectiveRoundNumber();
       final trickNumber = (cardManager.currentTrickNumber > 0 
           ? cardManager.currentTrickNumber 
           : 1).clamp(1, 13);
@@ -1590,7 +1586,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       final roomId = gameSession.roomId;
       if (roomId == null || roomId.isEmpty) return null;
 
-      final roundNumber = gameSession.currentRound;
+      final roundNumber = _effectiveRoundNumber();
       final trickNumber = (cardManager.currentTrickNumber > 0 
           ? cardManager.currentTrickNumber 
           : 1).clamp(1, 13);
@@ -3774,6 +3770,10 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
 
   void _showContinueGameDialog() {
     // À implémenter dans les sous-classes si nécessaire
+  }
+
+  int _effectiveRoundNumber() {
+    return gameSession.currentRound > 0 ? gameSession.currentRound : 1;
   }
 
   /// Quitte la partie et ramène l'utilisateur au tableau de bord (reste connecté).

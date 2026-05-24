@@ -559,6 +559,10 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
       final result = cardManager.shuffleAndDealCards(effectivePlayerNames);
 
       if (result['success'] == true) {
+        if (gameSession.currentRound < 1) {
+          gameSession.currentRound = 1;
+        }
+
         gameLogic.configurePlayers(
           playerCount: effectivePlayerNames.length,
           cardsPerPlayer: cardManager.cardsPerPlayer,

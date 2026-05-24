@@ -77,6 +77,45 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   StreamSubscription? _trickCompletedSubscription;
     StreamSubscription? _roundCompletedSubscription;
   StreamSubscription? _roundScoresUpdatedSubscription;
+
+  /// Numéro de manche côté serveur (évite currentRound=0 au premier round).
+  void _syncRoundNumber(int? roundNumber) {
+    if (roundNumber != null && roundNumber > 0) {
+      if (gameSession.currentRound != roundNumber) {
+        print('✅ currentRound synchronisé: ${gameSession.currentRound} → $roundNumber');
+      }
+      gameSession.currentRound = roundNumber;
+      return;
+    }
+    if (gameSession.currentRound < 1) {
+      gameSession.currentRound = 1;
+      print('✅ currentRound initialisé à 1 (première manche)');
+    }
+  }
+
+  int _effectiveRoundNumber() {
+    return gameSession.currentRound > 0 ? gameSession.currentRound : 1;
+  }
+
+  bool _matchesRoundNumber(int? roundNumber) {
+    if (roundNumber == null || roundNumber < 1) return false;
+    if (gameSession.currentRound < 1) return true;
+    return roundNumber == gameSession.currentRound;
+  }
+
+  Future<int?> _resolveGameId() async {
+    if (_currentGameId != null) return _currentGameId;
+    try {
+      final id = await getGameId();
+      if (id != null) {
+        _currentGameId = id;
+      }
+      return id;
+    } catch (e) {
+      print('⚠️ Impossible de résoudre gameId: $e');
+      return null;
+    }
+  }
   StreamSubscription? _cardDistributionSubscription;
   StreamSubscription? _turnChangedSubscription; // ✅ NOUVEAU: Écouter les changements de tour
 
@@ -996,6 +1035,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   }
 
   Future<void> _configureGameAfterDistribution(List<String> playerNames) async {
+    _syncRoundNumber(null);
+
     // ✅ Réinitialiser les événements de cartes pour éviter les doublons sur un nouveau round
     resetCardEventTracking();
     // ✅ S'assurer que le trick est bien vidé avant de commencer les annonces
@@ -1244,9 +1285,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       if (isCreator) {
         final currentPlayerCards = cardManager.getPlayerCards(widget.currentPlayerName);
         if (currentPlayerCards.isNotEmpty) {
-          print('ℹ️ Créateur: distribution déjà appliquée localement, ignore la distribution WebSocket');
-          // ✅ Mais s'assurer que les autres joueurs ont bien leurs cartes dans la distribution
-          // et configurer le jeu quand même
+          print('ℹ️ Créateur: distribution déjà appliquée localement, sync round=$roundNumber');
+          _syncRoundNumber(roundNumber);
           final playerNames = gameSession.players
               .map((p) => p['name'] as String? ?? 'Joueur')
               .toList();
@@ -1258,12 +1298,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       print('📥 Distribution reçue pour le round $roundNumber');
       print('   Joueurs dans la distribution: ${distribution.keys.toList()}');
       
-      // ✅ Mettre à jour currentRound à chaque nouvelle distribution
-      if (roundNumber != null && roundNumber > 0) {
-        final oldRound = gameSession.currentRound;
-        gameSession.currentRound = roundNumber;
-        print('✅ currentRound mis à jour: $oldRound → $roundNumber');
-      }
+      _syncRoundNumber(roundNumber);
       
       // ✅ Appliquer la distribution reçue
       final playerNames = gameSession.players
@@ -1613,7 +1648,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       final duration = data['duration'] as int? ?? 30;
       final gameId = data['game_id'] as int?; // ✅ Récupérer le game_id depuis l'événement
       
-      if (roomId == gameSession.roomId && roundNumber == gameSession.currentRound && startTimestamp != null) {
+      if (roomId == gameSession.roomId &&
+          _matchesRoundNumber(roundNumber) &&
+          startTimestamp != null) {
+        _syncRoundNumber(roundNumber);
         print('🎬 Phase d\'annonces simultanée démarrée: round=$roundNumber, start=$startTimestamp, duration=$duration, game_id=$gameId');
         
         // Stocker les informations de la phase
@@ -1681,9 +1719,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       final announcement = data['announcement'] as int? ?? data['announcement_value'] as int?;
       final submittedCount = data['submitted_count'] as int?;
       
-      if (roomId == gameSession.roomId && 
-          roundNumber == gameSession.currentRound && 
-          playerName != null && 
+      if (roomId == gameSession.roomId &&
+          _matchesRoundNumber(roundNumber) &&
+          playerName != null &&
           announcement != null) {
         print('📡 Annonce soumise: $playerName → $announcement plis (total: $submittedCount/4)');
         
@@ -1723,13 +1761,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       
       // ✅ AMÉLIORATION: Comparer les roomId en convertissant en string pour éviter les problèmes de type
       final roomIdMatch = roomId?.toString() == gameSession.roomId?.toString();
-      final roundNumberMatch = roundNumber == gameSession.currentRound;
+      final roundNumberMatch = _matchesRoundNumber(roundNumber);
       
       print('   - Match roomId: $roomIdMatch');
       print('   - Match roundNumber: $roundNumberMatch');
       print('   - Match total: ${roomIdMatch && roundNumberMatch}');
       
       if (roomIdMatch && roundNumberMatch) {
+        _syncRoundNumber(roundNumber);
         print('✅ Toutes les annonces sont terminées (système simultané)');
         print('   - Annonces: $announcements');
         print('   - Premier joueur: $firstPlayer');
@@ -5186,42 +5225,23 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     try {
       // ✅ Utiliser le game_id stocké depuis announcement_phase_started
       // ✅ CORRECTION: Si gameId est null, essayer de le récupérer via l'API
-      var gameId = _currentGameId;
-      final roundNumber = gameSession.currentRound;
-      
-      // ✅ Si gameId est null, essayer de le récupérer via getGameId() (appel API)
-      if (gameId == null) {
-        try {
-          gameId = await getGameId();
-          if (gameId != null) {
-            _currentGameId = gameId; // Stocker pour les prochaines annonces
-            print('✅ gameId récupéré via API: $gameId');
-          }
-        } catch (e) {
-          print('⚠️ Erreur lors de la récupération du gameId via API: $e');
-        }
-      }
-      
-      // ✅ Vérifier que les valeurs sont valides
+      _syncRoundNumber(null);
+      final roundNumber = _effectiveRoundNumber();
+      var gameId = await _resolveGameId();
+
       if (gameId == null) {
         print('❌ Impossible d\'obtenir le gameId (phase d\'annonces non démarrée?)');
-        // ✅ Ne pas bloquer l'utilisateur, juste logger l'erreur
-        // L'annonce sera gérée par le timeout si nécessaire
-        return;
-      }
-      
-      if (roundNumber < 1) {
-        print('❌ roundNumber invalide: $roundNumber (doit être >= 1)');
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text('Erreur: Numéro de round invalide'),
-            duration: const Duration(seconds: 2),
-            backgroundColor: Colors.red,
-            behavior: SnackBarBehavior.floating,
-            margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          ),
-        );
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Erreur: partie non synchronisée avec le serveur. Réessayez dans quelques secondes.'),
+              duration: Duration(seconds: 3),
+              backgroundColor: Colors.red,
+              behavior: SnackBarBehavior.floating,
+              margin: EdgeInsets.only(bottom: 100, left: 20, right: 20),
+            ),
+          );
+        }
         return;
       }
       
@@ -5328,8 +5348,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         print('🤖 [$botName] Tentative ${attempts + 1}/$maxRetries: annonce = $clampedAnnouncement plis');
         
         // ✅ Utiliser le game_id stocké depuis announcement_phase_started
-        final gameId = _currentGameId;
-        final roundNumber = gameSession.currentRound;
+        _syncRoundNumber(null);
+        final gameId = await _resolveGameId();
+        final roundNumber = _effectiveRoundNumber();
         
         if (gameId == null) {
           print('⚠️ gameId null pour $botName (phase d\'annonces non démarrée?), nouvelle tentative dans 1 seconde...');
