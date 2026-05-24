@@ -1,0 +1,5791 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'dart:async';
+import 'dart:math' as math;
+import 'dart:convert';
+import 'dart:typed_data';
+import 'package:crypto/crypto.dart' as crypto;
+import '../../services/api/game_api_service.dart';
+import '../../services/api/room_chat_api_service.dart';
+import '../../services/user/user_service.dart';
+import '../../models/game/local_card_manager.dart';
+import '../../services/websocket/game_websocket_service.dart';
+import 'game_room_base_page.dart';
+
+/// Page de jeu pour le MODE HUMAIN uniquement
+class GameRoomHumanPage extends GameRoomBasePage {
+  const GameRoomHumanPage({
+    super.key,
+    required super.roomName,
+    required super.roomCode,
+    required super.minimumBet,
+    super.currentPlayerName,
+  });
+
+  @override
+  State<GameRoomHumanPage> createState() => _GameRoomHumanPageState();
+}
+
+class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
+  // Timers
+  Timer? _announcementTimer;
+  Timer? _roomPollTimer;
+  Timer? _reconnectionCheckTimer;
+  Timer? _stateSyncTimer;
+  Timer? _chatPollingTimer;
+  Timer? _chatToastTimer;
+  Timer? _continueCountdownTimer;
+  Timer? _roomCodeCheckTimer;
+  Timer? _countersSyncTimer; // ✅ Timer pour synchroniser les compteurs de plis automatiquement
+
+  // États bool/int
+  int _announcementCountdown = 30;
+  bool _hasAnnounced = false;
+  String? _currentAnnouncementPlayer;
+  int _currentAnnouncement = 2;
+  // ✅ NOUVEAU: États pour le système d'annonces simultané
+  int? _announcementPhaseStartTimestamp; // Timestamp serveur du début de la phase
+  int _announcementPhaseDuration = 30; // Durée en secondes
+  Timer? _announcementPhaseTimer; // Timer pour le compte à rebours
+  int? _currentGameId; // ✅ game_id reçu dans announcement_phase_started
+  bool _waitingForHumans = false;
+  bool _isProcessingAnnouncementTurn = false;
+  bool _isProcessingAnnouncementCompletion = false;
+  String? _currentPlayerPlaying;
+  bool _isWebSocketConnected = false;
+  int _consecutiveStatePollingErrors = 0;
+  bool _hasGameStarted = false;
+  DateTime? _lastSuccessfulStatePoll;
+  bool? _continueGameChoice;
+  int _continueCountdown = 5;
+
+  // Subscriptions
+  StreamSubscription? _wsConnectSubscription;
+  StreamSubscription? _wsDisconnectSubscription;
+  StreamSubscription? _wsErrorSubscription;
+  StreamSubscription? _playerReplacedSubscription;
+  StreamSubscription? _playerRestoredSubscription;
+  StreamSubscription? _playerDisconnectedSubscription;
+  StreamSubscription? _playerReconnectedSubscription;
+  StreamSubscription? _announcementMadeSubscription;
+  StreamSubscription? _allAnnouncementsCompletedSubscription;
+  StreamSubscription? _announcementPhaseStartedSubscription;
+  StreamSubscription? _announcementSubmittedSubscription;
+  StreamSubscription? _announcementsCompleteSubscription;
+  StreamSubscription? _roomChatMessageSubscription;
+  StreamSubscription? _cardPlayedSubscription;
+  StreamSubscription? _trickCompletedSubscription;
+    StreamSubscription? _roundCompletedSubscription;
+  StreamSubscription? _roundScoresUpdatedSubscription;
+  StreamSubscription? _cardDistributionSubscription;
+  StreamSubscription? _turnChangedSubscription; // ✅ NOUVEAU: Écouter les changements de tour
+
+  // Collections
+  final Map<String, Map<String, dynamic>> _temporaryReplacements = {};
+  final Set<String> _permanentlyExcludedPlayers = {};
+  final List<Map<String, dynamic>> _chatMessages = [];
+  final Set<int> _knownChatMessageIds = <int>{};
+  int? _lastChatMessageId;
+  bool _isFetchingChat = false;
+  
+  // ✅ Cache des cartes jouables depuis le backend (pour éviter les erreurs 422)
+  Set<String> _playableCardCodes = {};
+  bool _isUpdatingPlayableCards = false;
+
+  // Animations & controllers
+  late AnimationController _cardAnimationController;
+  Animation<double>? _cardAnimation;
+  Map<String, dynamic>? _animatedCard;
+  String? _animatingPlayerName;
+  bool _isAnimatingCard = false;
+
+  bool _chatFeatureInitialized = false;
+  bool _isChatPanelVisible = false;
+  late TextEditingController _chatInputController;
+  late ScrollController _chatScrollController;
+  bool _isSendingChatMessage = false;
+  Map<String, dynamic>? _chatToastMessage;
+  late AnimationController _chatToastAnimationController;
+  Animation<double>? _chatToastAnimation;
+
+  String? _lastTrickWinner;
+  bool _isCollectingTrick = false;
+  
+  // ✅ Système de logs pour débogage (affichage dans l'UI)
+  final List<String> _debugLogs = [];
+  bool _showDebugLogs = false;
+  static const int _maxLogs = 20;
+
+  bool get _useTestDistribution {
+    if (!kDebugMode) return false;
+    final playerCount = gameSession.players.length;
+    return playerCount == 2;
+  }
+
+  // ✅ Surcharger isTestMode pour retourner _useTestDistribution
+  @override
+  bool isTestMode() => _useTestDistribution;
+
+  // ===================== Getter/Setter overrides =====================
+  @override
+  Timer? get announcementTimer => _announcementTimer;
+  @override
+  set announcementTimer(Timer? value) => _announcementTimer = value;
+
+  @override
+  Timer? get roomPollTimer => _roomPollTimer;
+  @override
+  set roomPollTimer(Timer? value) => _roomPollTimer = value;
+
+  @override
+  Timer? get reconnectionCheckTimer => _reconnectionCheckTimer;
+  @override
+  set reconnectionCheckTimer(Timer? value) => _reconnectionCheckTimer = value;
+
+  @override
+  Timer? get stateSyncTimer => _stateSyncTimer;
+  @override
+  set stateSyncTimer(Timer? value) => _stateSyncTimer = value;
+
+  @override
+  Timer? get chatPollingTimer => _chatPollingTimer;
+  @override
+  set chatPollingTimer(Timer? value) => _chatPollingTimer = value;
+
+  @override
+  Timer? get chatToastTimer => _chatToastTimer;
+  @override
+  set chatToastTimer(Timer? value) => _chatToastTimer = value;
+
+  @override
+  Timer? get continueCountdownTimer => _continueCountdownTimer;
+  @override
+  set continueCountdownTimer(Timer? value) => _continueCountdownTimer = value;
+
+  @override
+  Timer? get roomCodeCheckTimer => _roomCodeCheckTimer;
+  @override
+  set roomCodeCheckTimer(Timer? value) => _roomCodeCheckTimer = value;
+
+  @override
+  int get announcementCountdown => _announcementCountdown;
+  @override
+  set announcementCountdown(int value) => _announcementCountdown = value;
+
+  @override
+  bool get hasAnnounced => _hasAnnounced;
+  @override
+  set hasAnnounced(bool value) => _hasAnnounced = value;
+
+  @override
+  String? get currentAnnouncementPlayer => _currentAnnouncementPlayer;
+  @override
+  set currentAnnouncementPlayer(String? value) =>
+      _currentAnnouncementPlayer = value;
+
+  @override
+  int get currentAnnouncement => _currentAnnouncement;
+  @override
+  set currentAnnouncement(int value) => _currentAnnouncement = value;
+
+  @override
+  bool get waitingForHumans => _waitingForHumans;
+  @override
+  set waitingForHumans(bool value) => _waitingForHumans = value;
+
+  @override
+  bool get isProcessingAnnouncementTurn => _isProcessingAnnouncementTurn;
+  @override
+  set isProcessingAnnouncementTurn(bool value) =>
+      _isProcessingAnnouncementTurn = value;
+
+  @override
+  bool get isProcessingAnnouncementCompletion =>
+      _isProcessingAnnouncementCompletion;
+  @override
+  set isProcessingAnnouncementCompletion(bool value) =>
+      _isProcessingAnnouncementCompletion = value;
+
+  @override
+  String? get currentPlayerPlaying => _currentPlayerPlaying;
+  @override
+  set currentPlayerPlaying(String? value) => _currentPlayerPlaying = value;
+
+  @override
+  bool get isWebSocketConnected => _isWebSocketConnected;
+  @override
+  set isWebSocketConnected(bool value) => _isWebSocketConnected = value;
+
+  @override
+  int get consecutiveStatePollingErrors => _consecutiveStatePollingErrors;
+  @override
+  set consecutiveStatePollingErrors(int value) =>
+      _consecutiveStatePollingErrors = value;
+
+  @override
+  bool get hasGameStarted => _hasGameStarted;
+  @override
+  set hasGameStarted(bool value) => _hasGameStarted = value;
+
+  @override
+  DateTime? get lastSuccessfulStatePoll => _lastSuccessfulStatePoll;
+  @override
+  set lastSuccessfulStatePoll(DateTime? value) =>
+      _lastSuccessfulStatePoll = value;
+
+  @override
+  StreamSubscription? get wsConnectSubscription => _wsConnectSubscription;
+  @override
+  set wsConnectSubscription(StreamSubscription? value) =>
+      _wsConnectSubscription = value;
+
+  @override
+  StreamSubscription? get wsDisconnectSubscription =>
+      _wsDisconnectSubscription;
+  @override
+  set wsDisconnectSubscription(StreamSubscription? value) =>
+      _wsDisconnectSubscription = value;
+
+  @override
+  StreamSubscription? get wsErrorSubscription => _wsErrorSubscription;
+  @override
+  set wsErrorSubscription(StreamSubscription? value) =>
+      _wsErrorSubscription = value;
+
+  @override
+  StreamSubscription? get playerReplacedSubscription =>
+      _playerReplacedSubscription;
+  @override
+  set playerReplacedSubscription(StreamSubscription? value) =>
+      _playerReplacedSubscription = value;
+
+  @override
+  StreamSubscription? get playerRestoredSubscription =>
+      _playerRestoredSubscription;
+  @override
+  set playerRestoredSubscription(StreamSubscription? value) =>
+      _playerRestoredSubscription = value;
+
+  @override
+  StreamSubscription? get playerDisconnectedSubscription =>
+      _playerDisconnectedSubscription;
+  @override
+  set playerDisconnectedSubscription(StreamSubscription? value) =>
+      _playerDisconnectedSubscription = value;
+
+  @override
+  StreamSubscription? get playerReconnectedSubscription =>
+      _playerReconnectedSubscription;
+  @override
+  set playerReconnectedSubscription(StreamSubscription? value) =>
+      _playerReconnectedSubscription = value;
+
+  @override
+  StreamSubscription? get announcementMadeSubscription =>
+      _announcementMadeSubscription;
+  @override
+  set announcementMadeSubscription(StreamSubscription? value) =>
+      _announcementMadeSubscription = value;
+
+  @override
+  StreamSubscription? get roomChatMessageSubscription =>
+      _roomChatMessageSubscription;
+  @override
+  set roomChatMessageSubscription(StreamSubscription? value) =>
+      _roomChatMessageSubscription = value;
+
+  @override
+  StreamSubscription? get cardPlayedSubscription => _cardPlayedSubscription;
+  @override
+  set cardPlayedSubscription(StreamSubscription? value) =>
+      _cardPlayedSubscription = value;
+
+  @override
+  Map<String, Map<String, dynamic>> get temporaryReplacements =>
+      _temporaryReplacements;
+
+  @override
+  Set<String> get permanentlyExcludedPlayers =>
+      _permanentlyExcludedPlayers;
+
+  @override
+  AnimationController get cardAnimationController => _cardAnimationController;
+  @override
+  set cardAnimationController(AnimationController controller) =>
+      _cardAnimationController = controller;
+
+  @override
+  Animation<double>? get cardAnimation => _cardAnimation;
+  @override
+  set cardAnimation(Animation<double>? value) => _cardAnimation = value;
+
+  @override
+  Map<String, dynamic>? get animatedCard => _animatedCard;
+  @override
+  set animatedCard(Map<String, dynamic>? value) => _animatedCard = value;
+
+  @override
+  String? get animatingPlayerName => _animatingPlayerName;
+  @override
+  set animatingPlayerName(String? value) => _animatingPlayerName = value;
+
+  @override
+  bool get isAnimatingCard => _isAnimatingCard;
+  @override
+  set isAnimatingCard(bool value) => _isAnimatingCard = value;
+
+  @override
+  bool get chatFeatureInitialized => _chatFeatureInitialized;
+  @override
+  set chatFeatureInitialized(bool value) => _chatFeatureInitialized = value;
+
+  @override
+  bool get isChatPanelVisible => _isChatPanelVisible;
+  @override
+  set isChatPanelVisible(bool value) => _isChatPanelVisible = value;
+
+  @override
+  TextEditingController get chatInputController => _chatInputController;
+
+  @override
+  ScrollController get chatScrollController => _chatScrollController;
+
+  @override
+  List<Map<String, dynamic>> get chatMessages => _chatMessages;
+  @override
+  set chatMessages(List<Map<String, dynamic>> value) {
+    _chatMessages
+      ..clear()
+      ..addAll(value);
+  }
+
+  @override
+  bool get isSendingChatMessage => _isSendingChatMessage;
+  @override
+  set isSendingChatMessage(bool value) => _isSendingChatMessage = value;
+
+  @override
+  Map<String, dynamic>? get chatToastMessage => _chatToastMessage;
+  @override
+  set chatToastMessage(Map<String, dynamic>? value) =>
+      _chatToastMessage = value;
+
+  @override
+  AnimationController get chatToastAnimationController =>
+      _chatToastAnimationController;
+  @override
+  set chatToastAnimationController(AnimationController controller) =>
+      _chatToastAnimationController = controller;
+
+  @override
+  Animation<double>? get chatToastAnimation => _chatToastAnimation;
+  @override
+  set chatToastAnimation(Animation<double>? value) =>
+      _chatToastAnimation = value;
+
+  @override
+  String? get lastTrickWinner => _lastTrickWinner;
+  @override
+  set lastTrickWinner(String? value) => _lastTrickWinner = value;
+
+  @override
+  bool get isCollectingTrick => _isCollectingTrick;
+  @override
+  set isCollectingTrick(bool value) => _isCollectingTrick = value;
+
+  @override
+  bool? get continueGameChoice => _continueGameChoice;
+  @override
+  set continueGameChoice(bool? value) => _continueGameChoice = value;
+
+  @override
+  int get continueCountdown => _continueCountdown;
+  @override
+  set continueCountdown(int value) => _continueCountdown = value;
+
+  @override
+  void onGameRoomInitialize() {
+    _chatInputController = TextEditingController();
+    _chatScrollController = ScrollController();
+    _cardAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 550),
+      vsync: this,
+    );
+    cardAnimation = CurvedAnimation(
+      parent: _cardAnimationController,
+      curve: Curves.easeInOut,
+    );
+    _chatToastAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 7000),
+      vsync: this,
+    );
+    chatToastAnimation = Tween<double>(begin: -1.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _chatToastAnimationController,
+        curve: Curves.linear,
+      ),
+    );
+
+    _initializeWebSocketListeners();
+
+    // ✅ AJOUTER ICI: Synchronisation périodique des compteurs
+    _startCountersSyncPolling();
+
+    if (!gameSession.playWithBots && requiredPlayers > 0) {
+      waitingForHumans = true;
+      _startRoomPolling();
+    }
+  }
+
+  @override
+  void onGameRoomDispose() {
+    announcementTimer?.cancel();
+    roomPollTimer?.cancel();
+    reconnectionCheckTimer?.cancel();
+    stateSyncTimer?.cancel();
+    chatPollingTimer?.cancel();
+    chatToastTimer?.cancel();
+    continueCountdownTimer?.cancel();
+    roomCodeCheckTimer?.cancel();
+    _countersSyncTimer?.cancel(); // ✅ Annuler le timer de synchronisation des compteurs
+
+    wsConnectSubscription?.cancel();
+    wsDisconnectSubscription?.cancel();
+    wsErrorSubscription?.cancel();
+    playerReplacedSubscription?.cancel();
+    playerRestoredSubscription?.cancel();
+    playerDisconnectedSubscription?.cancel();
+    playerReconnectedSubscription?.cancel();
+    announcementMadeSubscription?.cancel();
+    _allAnnouncementsCompletedSubscription?.cancel();
+    _announcementPhaseStartedSubscription?.cancel();
+    _announcementSubmittedSubscription?.cancel();
+    _announcementsCompleteSubscription?.cancel();
+    _announcementPhaseTimer?.cancel();
+    roomChatMessageSubscription?.cancel();
+    cardPlayedSubscription?.cancel();
+    _trickCompletedSubscription?.cancel();
+    _roundCompletedSubscription?.cancel();
+    _cardDistributionSubscription?.cancel();
+    _turnChangedSubscription?.cancel(); // ✅ NOUVEAU: Annuler l'écoute des changements de tour
+
+    _chatInputController.dispose();
+    _chatScrollController.dispose();
+    _cardAnimationController.dispose();
+    _chatToastAnimationController.dispose();
+  }
+
+  @override
+  void startChatPolling() {
+    if (gameSession.playWithBots) {
+      chatPollingTimer?.cancel();
+      return;
+    }
+
+    chatPollingTimer?.cancel();
+    _fetchChatMessagesFromApi();
+    // ✅ Réduire la fréquence du polling (10 secondes au lieu de 4) car WebSocket gère déjà les messages en temps réel
+    chatPollingTimer =
+        Timer.periodic(const Duration(seconds: 10), (_) => _fetchChatMessagesFromApi());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (bool didPop, dynamic result) {
+        if (!didPop) {
+          _showLeaveGameConfirmation();
+        }
+      },
+      child: Scaffold(
+        body: Container(
+          decoration: const BoxDecoration(
+            image: DecorationImage(
+              image: AssetImage('assets/images/roomTable.jpeg'),
+              fit: BoxFit.cover,
+            ),
+          ),
+          child: SafeArea(
+            child: Stack(
+              children: [
+                if (waitingForHumans)
+                  Positioned.fill(
+                    child: Container(
+                      color: Colors.black.withOpacity(0.6),
+                      child: Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const CircularProgressIndicator(color: Colors.white),
+                            const SizedBox(height: 16),
+                            Text(
+                              'Attendons les autres joueurs (${gameSession.players.length}/$requiredPlayers)',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 22,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                
+                _buildPlayerHand(),
+                _buildPlayers(),
+                _buildCenterTrick(),
+                
+                if (isAnimatingCard && animatedCard != null)
+                  _buildAnimatedCard(),
+
+                _buildGameControls(),
+                _buildTurnMessage(),
+                _buildAnnouncementPanel(),
+                _buildAnnouncementNotification(),
+                
+                // ✅ Widget de logs de débogage (uniquement en mode debug)
+                if (kDebugMode) _buildDebugLogs(),
+                
+                // ✅ Message d'annonce supprimé - les joueurs font simplement leur annonce
+
+                _buildRoomInfo(),
+                
+                // Chat pour le mode humain uniquement
+                _buildChatOverlay(),
+                _buildChatToast(),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  @override
+  Future<void> startCardDistribution() async {
+    try {
+      final playerNames = gameSession.players
+          .map((player) => player['name'] as String? ?? 'Joueur')
+          .toList();
+
+      if (playerNames.isEmpty) {
+        final roomId = gameSession.roomId ?? '';
+        if (roomId.isNotEmpty) {
+          try {
+            final res = await GameApiService.instance.getRoom(roomId: roomId);
+            final data = (res['data'] as Map?) ?? res;
+            final players = (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+            final currentName = UserService.instance.currentUserPseudo ?? '';
+            
+            // ✅ Normaliser tous les joueurs avec leurs noms
+            final normalizedPlayers = players.map((p) {
+              final pseudo = (p['pseudo'] ?? '').toString();
+              final first = (p['first_name'] ?? '').toString();
+              final last = (p['last_name'] ?? '').toString();
+              final name = (pseudo.isNotEmpty
+                      ? pseudo
+                      : ([first, last]
+                            .where((s) => s.isNotEmpty)
+                            .join(' ')
+                            .trim()))
+                  .trim();
+              return {
+                ...p,
+                'normalizedName': name.isNotEmpty ? name : 'Joueur',
+              };
+            }).toList();
+            
+            // ✅ Trier tous les joueurs par position backend pour avoir l'ordre de rotation
+            normalizedPlayers.sort((a, b) =>
+                ((a['position'] ?? 0) as int)
+                    .compareTo((b['position'] ?? 0) as int));
+            
+            // ✅ Trouver l'index du joueur actuel dans la liste triée
+            final currentPlayerIndex = normalizedPlayers.indexWhere(
+              (p) => (p['normalizedName'] as String?) == currentName && currentName.isNotEmpty,
+            );
+            
+            if (currentPlayerIndex == -1 && normalizedPlayers.isNotEmpty) {
+              // Si le joueur actuel n'est pas trouvé, utiliser le premier
+              final firstPlayer = normalizedPlayers[0];
+              final normalized = <Map<String, dynamic>>[];
+              final name = firstPlayer['normalizedName'] as String;
+              final isBot = (firstPlayer['is_bot'] ?? false) == true;
+              final backendAvatar = (firstPlayer['avatar'] ?? '').toString();
+              final isCreator = ((firstPlayer['is_creator'] ?? firstPlayer['isCreator']) == true);
+              
+              final resolvedAvatar = isBot
+                  ? '🤖'
+                  : (backendAvatar.isNotEmpty ? backendAvatar : '👤');
+              
+              normalized.add({
+                'name': name,
+                'displayPosition': 'bottom',
+                'avatar': resolvedAvatar,
+                'isCurrentPlayer': true,
+                'isCreator': isCreator,
+                'score': '0/0',
+                'cards': 13,
+                'is_bot': isBot,
+              });
+              
+              // Ajouter les autres joueurs
+              final displayPositions = ['right', 'top', 'left'];
+              for (int i = 1; i < normalizedPlayers.length && i < 4; i++) {
+                final p = normalizedPlayers[i];
+                final pName = p['normalizedName'] as String;
+                final pIsBot = (p['is_bot'] ?? false) == true;
+                final pAvatar = (p['avatar'] ?? '').toString();
+                final pIsCreator = ((p['is_creator'] ?? p['isCreator']) == true);
+                
+                final resolvedAvatar = pIsBot
+                    ? '🤖'
+                    : (pAvatar.isNotEmpty ? pAvatar : '👤');
+                
+                normalized.add({
+                  'name': pName,
+                  'displayPosition': displayPositions[i - 1],
+                  'avatar': resolvedAvatar,
+                  'isCurrentPlayer': false,
+                  'isCreator': pIsCreator,
+                  'score': '0/0',
+                  'cards': 13,
+                  'is_bot': pIsBot,
+                });
+              }
+              
+              if (normalized.isNotEmpty) {
+                setState(() {
+                  gameSession.players = normalized;
+                  gameSession.globalScores = List.filled(normalized.length, 0.0);
+                });
+              }
+              return;
+            }
+            
+            if (currentPlayerIndex == -1) {
+              return;
+            }
+            
+            // ✅ Créer une rotation cyclique : le joueur actuel en premier (bottom), puis les suivants
+            final rotatedPlayers = <Map<String, dynamic>>[];
+            for (int i = 0; i < normalizedPlayers.length; i++) {
+              final index = (currentPlayerIndex + i) % normalizedPlayers.length;
+              rotatedPlayers.add(normalizedPlayers[index]);
+            }
+            
+            // ✅ Positions d'affichage dans l'ordre : bottom, right, top, left
+            final displayPositions = ['bottom', 'right', 'top', 'left'];
+            final normalized = <Map<String, dynamic>>[];
+            
+            for (int i = 0; i < rotatedPlayers.length && i < 4; i++) {
+              final p = rotatedPlayers[i];
+              final name = p['normalizedName'] as String;
+              final isCurrent = name == currentName && currentName.isNotEmpty;
+              // ✅ Accepter à la fois true (booléen) et 1 (entier) comme valeur "bot"
+              final isBotValue = p['is_bot'];
+              final isBot = isBotValue == true || isBotValue == 1 || (isBotValue is String && isBotValue == '1');
+              final backendAvatar = (p['avatar'] ?? '').toString();
+              final isCreator = ((p['is_creator'] ?? p['isCreator']) == true);
+              
+              final resolvedAvatar = isBot
+                  ? '🤖'
+                  : (backendAvatar.isNotEmpty ? backendAvatar : '👤');
+              
+              normalized.add({
+                'name': name,
+                'displayPosition': displayPositions[i],
+                'avatar': resolvedAvatar,
+                'isCurrentPlayer': isCurrent,
+                'isCreator': isCreator,
+                'score': '0/0',
+                'cards': 13,
+                'is_bot': isBot,
+              });
+            }
+            
+            if (normalized.isNotEmpty) {
+              setState(() {
+                gameSession.players = normalized;
+                gameSession.globalScores = List.filled(normalized.length, 0.0);
+              });
+            }
+          } catch (_) {}
+        }
+      }
+
+      var effectivePlayerNames = gameSession.players
+          .map((player) => player['name'] as String? ?? 'Joueur')
+          .where((n) => n.isNotEmpty)
+          .toList();
+          
+      if (effectivePlayerNames.isEmpty) {
+        print('⚠️ Aucun joueur disponible');
+        return;
+      }
+
+      // ✅ AJOUT AUTOMATIQUE DE BOTS: Si seulement 2 joueurs, compléter avec Bot 1 et Bot 2
+      // En mode test, on veut toujours 4 joueurs (2 humains + 2 bots) pour que le backend distribue correctement
+      print('🔍 Vérification ajout bots:');
+      print('   effectivePlayerNames.length=${effectivePlayerNames.length}');
+      print('   gameSession.players.length=${gameSession.players.length}');
+      print('   _useTestDistribution=$_useTestDistribution');
+      print('   kDebugMode=${kDebugMode}');
+      
+      if (effectivePlayerNames.length == 2 && _useTestDistribution) {
+        final roomId = gameSession.roomId ?? '';
+        if (roomId.isNotEmpty) {
+          try {
+            print('🤖 Ajout automatique de Bot 1 et Bot 2 pour compléter à 4 joueurs...');
+            final fillBotsResult = await GameApiService.instance.fillBots(roomId: roomId);
+            print('✅ fillBots appelé avec succès: $fillBotsResult');
+            
+            // ✅ Attendre un peu pour que le backend traite l'ajout des bots
+            await Future.delayed(const Duration(milliseconds: 500));
+            
+            // ✅ Recharger les joueurs depuis le backend après ajout des bots
+            final res = await GameApiService.instance.getRoom(roomId: roomId);
+            final data = (res['data'] as Map?) ?? res;
+            final players = (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+            print('📊 Joueurs récupérés depuis backend après fillBots: ${players.length}');
+            for (var p in players) {
+              final pseudo = (p['pseudo'] ?? '').toString();
+              final first = (p['first_name'] ?? '').toString();
+              final last = (p['last_name'] ?? '').toString();
+              // ✅ Accepter à la fois true (booléen) et 1 (entier) comme valeur "bot"
+              final isBotValue = p['is_bot'];
+              final isBot = isBotValue == true || isBotValue == 1 || (isBotValue is String && isBotValue == '1');
+              final name = (pseudo.isNotEmpty
+                      ? pseudo
+                      : ([first, last]
+                            .where((s) => s.isNotEmpty)
+                            .join(' ')
+                            .trim()))
+                  .trim();
+              print('   - $name: is_bot=$isBotValue (type: ${isBotValue.runtimeType}), normalisé=$isBot');
+              // ✅ Debug: Afficher toutes les clés pour voir ce que le backend retourne
+              if (name.contains('Bot')) {
+                print('      🔍 Toutes les clés du bot: ${p.keys.toList()}');
+                print('      🔍 Valeur brute is_bot: ${p['is_bot']} (type: ${p['is_bot']?.runtimeType})');
+              }
+            }
+            
+            final currentName = UserService.instance.currentUserPseudo ?? '';
+            
+            // ✅ Normaliser tous les joueurs avec leurs noms
+            final normalizedPlayers = players.map((p) {
+              final pseudo = (p['pseudo'] ?? '').toString();
+              final first = (p['first_name'] ?? '').toString();
+              final last = (p['last_name'] ?? '').toString();
+              final name = (pseudo.isNotEmpty
+                      ? pseudo
+                      : ([first, last]
+                            .where((s) => s.isNotEmpty)
+                            .join(' ')
+                            .trim()))
+                  .trim();
+              
+              // ✅ Préserver is_bot correctement (accepter 1, true, '1')
+              final isBotValue = p['is_bot'];
+              final isBot = isBotValue == true || isBotValue == 1 || (isBotValue is String && isBotValue == '1');
+              
+              // ✅ Debug détaillé pour les bots
+              if (name.contains('Bot') || pseudo.contains('Bot')) {
+                print('   🔍 Normalisation BOT $name:');
+                print('      - pseudo: $pseudo');
+                print('      - isBotValue brut: $isBotValue (type: ${isBotValue?.runtimeType})');
+                print('      - isBot calculé: $isBot');
+                print('      - Toutes les clés: ${p.keys.toList()}');
+              }
+              
+              return {
+                ...p,
+                'normalizedName': name.isNotEmpty ? name : 'Joueur',
+                'is_bot': isBot, // ✅ Forcer la valeur booléenne
+              };
+            }).toList();
+            
+            // ✅ Trier tous les joueurs par position backend pour avoir l'ordre de rotation
+            normalizedPlayers.sort((a, b) =>
+                ((a['position'] ?? 0) as int)
+                    .compareTo((b['position'] ?? 0) as int));
+            
+            // ✅ Trouver l'index du joueur actuel dans la liste triée
+            final currentPlayerIndex = normalizedPlayers.indexWhere(
+              (p) => (p['normalizedName'] as String?) == currentName && currentName.isNotEmpty,
+            );
+            
+            if (currentPlayerIndex == -1) {
+              print('⚠️ Joueur actuel non trouvé dans la liste des joueurs après fillBots');
+              return;
+            }
+            
+            // ✅ Créer une rotation cyclique : le joueur actuel en premier (bottom), puis les suivants
+            final rotatedPlayers = <Map<String, dynamic>>[];
+            for (int i = 0; i < normalizedPlayers.length; i++) {
+              final index = (currentPlayerIndex + i) % normalizedPlayers.length;
+              rotatedPlayers.add(normalizedPlayers[index]);
+            }
+            
+            // ✅ Positions d'affichage dans l'ordre : bottom, right, top, left
+            final displayPositions = ['bottom', 'right', 'top', 'left'];
+            final normalized = <Map<String, dynamic>>[];
+            
+            for (int i = 0; i < rotatedPlayers.length && i < 4; i++) {
+              final p = rotatedPlayers[i];
+              final name = p['normalizedName'] as String;
+              final isCurrent = name == currentName && currentName.isNotEmpty;
+              
+              // ✅ Utiliser la valeur booléenne préservée dans normalizedPlayers
+              final isBot = (p['is_bot'] as bool?) ?? false;
+              
+              // ✅ Debug: Afficher la valeur pour vérifier
+              if (name.contains('Bot')) {
+                print('   🔍 Debug bot $name: is_bot=$isBot (type: ${isBot.runtimeType})');
+              }
+              
+              final backendAvatar = (p['avatar'] ?? '').toString();
+              final isCreator = ((p['is_creator'] ?? p['isCreator']) == true);
+              
+              normalized.add({
+                'name': name,
+                'displayPosition': displayPositions[i],
+                'avatar': backendAvatar.isNotEmpty
+                    ? backendAvatar
+                    : (isBot ? '🤖' : '👤'),
+                'isCurrentPlayer': isCurrent,
+                'isCreator': isCreator,
+                'score': '0/0',
+                'cards': 13,
+                'is_bot': isBot, // ✅ Valeur booléenne préservée
+              });
+            }
+            
+            if (normalized.isNotEmpty) {
+              setState(() {
+                gameSession.players = normalized;
+                gameSession.globalScores = List.filled(normalized.length, 0.0);
+              });
+              
+              // ✅ Mettre à jour la liste des noms de joueurs
+              effectivePlayerNames = normalized
+                  .map((player) => player['name'] as String? ?? 'Joueur')
+                  .where((n) => n.isNotEmpty)
+                  .toList();
+              
+              print('✅ Bots ajoutés: ${effectivePlayerNames.length} joueurs maintenant');
+              print('   Liste des joueurs: ${effectivePlayerNames.join(", ")}');
+              // ✅ Debug: Afficher les détails de chaque joueur pour vérifier is_bot
+              print('   📊 Détails des joueurs normalisés:');
+              for (final player in normalized) {
+                final name = player['name'] as String? ?? 'Joueur';
+                final isBot = (player['is_bot'] as bool?) == true;
+                print('     - $name: is_bot=$isBot');
+              }
+            } else {
+              print('⚠️ Aucun joueur normalisé après fillBots');
+            }
+          } catch (e, stackTrace) {
+            print('⚠️ Erreur lors de l\'ajout des bots: $e');
+            print('   Stack trace: $stackTrace');
+            // Continuer même si l'ajout des bots échoue
+          }
+        } else {
+          print('⚠️ Room ID vide, impossible d\'ajouter les bots');
+        }
+      } else {
+        print('ℹ️ Condition non remplie pour ajout automatique des bots');
+        print('   effectivePlayerNames.length == 2: ${effectivePlayerNames.length == 2}');
+        print('   _useTestDistribution: $_useTestDistribution');
+      }
+
+      if (effectivePlayerNames.length < requiredPlayers) {
+        waitingForHumans = true;
+        setState(() {});
+        return;
+      }
+
+      waitingForHumans = false;
+      setState(() {});
+
+      // ✅ Déterminer qui est le créateur
+      final isCreator = gameSession.players.any(
+        (p) => (p['name'] as String?) == widget.currentPlayerName && 
+               (p['isCreator'] as bool?) == true,
+      );
+
+      if (isCreator) {
+        // ✅ LE CRÉATEUR demande au backend de distribuer les cartes
+        // Le backend gère le mélange et envoie la distribution via WebSocket
+        print('👑 Créateur: demande de distribution des cartes au backend...');
+        
+        final roomId = gameSession.roomId ?? '';
+        if (roomId.isEmpty) {
+          print('❌ Room ID manquant, impossible de distribuer');
+          return;
+        }
+        
+        try {
+          // ✅ Utiliser la liste mise à jour des joueurs (après ajout des bots si nécessaire)
+          final finalPlayerNames = gameSession.players
+              .map((player) => player['name'] as String? ?? 'Joueur')
+              .where((n) => n.isNotEmpty)
+              .toList();
+          
+          print('📊 Distribution des cartes pour ${finalPlayerNames.length} joueurs: ${finalPlayerNames.join(", ")}');
+          
+          if (_useTestDistribution) {
+            print('🧪 Mode test: distribution forcée à 13 cartes fixes');
+          }
+          // ✅ Appeler l'API backend pour distribuer les cartes
+          await GameApiService.instance.distributeCards(
+            roomId: roomId,
+            roundNumber: gameSession.currentRound + 1,
+            testMode: _useTestDistribution,
+          ).then((response) {
+            print('✅ Backend a distribué les cartes: $response');
+            // La distribution sera reçue via WebSocket dans _cardDistributionSubscription
+            // Pas besoin de configurer le jeu ici, ce sera fait dans le listener
+          }).catchError((e) {
+            print('❌ Erreur lors de la demande de distribution: $e');
+            print('❌ ERREUR CRITIQUE: Le backend n\'a pas pu distribuer les cartes');
+            print('   La distribution locale est DÉSACTIVÉE - seul le backend peut distribuer');
+            // ❌ NE PLUS FAIRE DE FALLBACK LOCAL - Le backend est la seule source de vérité
+            // Afficher un message d'erreur à l'utilisateur
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: const Text('Erreur: Impossible de distribuer les cartes. Veuillez réessayer.'),
+                  backgroundColor: Colors.red,
+                  duration: const Duration(seconds: 5),
+                  behavior: SnackBarBehavior.floating,
+                  margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                ),
+              );
+            }
+          });
+        } catch (e) {
+          print('❌ Exception lors de la demande de distribution: $e');
+          print('❌ ERREUR CRITIQUE: Exception lors de la distribution');
+          print('   La distribution locale est DÉSACTIVÉE - seul le backend peut distribuer');
+          // ❌ NE PLUS FAIRE DE FALLBACK LOCAL
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Erreur: Impossible de distribuer les cartes. Veuillez réessayer.'),
+                backgroundColor: Colors.red,
+                duration: Duration(seconds: 5),
+              ),
+            );
+          }
+        }
+      } else {
+        // ✅ LES AUTRES JOUEURS attendent la distribution
+        print('⏳ En attente de la distribution des cartes...');
+        
+        // Listener déjà configuré dans _initializeWebSocketListeners
+        // La distribution sera appliquée quand l'événement arrive
+      }
+    } catch (e) {
+      print('❌ Erreur distribution: $e');
+    }
+  }
+
+  Future<void> _configureGameAfterDistribution(List<String> playerNames) async {
+    // ✅ Réinitialiser les événements de cartes pour éviter les doublons sur un nouveau round
+    resetCardEventTracking();
+    // ✅ S'assurer que le trick est bien vidé avant de commencer les annonces
+    cardManager.clearCurrentTrick();
+    
+    gameLogic.configurePlayers(
+      playerCount: playerNames.length,
+      cardsPerPlayer: cardManager.cardsPerPlayer,
+    );
+
+    // Hash de vérification (optionnel pour le créateur)
+    try {
+      final List<String> orderedCodes = [];
+      for (final name in playerNames) {
+        final hand = cardManager.getPlayerCards(name);
+        for (final c in hand) {
+          orderedCodes.add((c['code'] as String?) ?? '');
+        }
+      }
+      final payload = orderedCodes.join('-');
+      final bytes = utf8.encode(payload);
+      final hash = crypto.sha256.convert(bytes).toString();
+      final roomId = gameSession.roomId ?? '';
+      if (roomId.isNotEmpty) {
+        GameApiService.instance.startRound(
+          roomId: roomId,
+          roundNumber: gameSession.currentRound + 1,
+          deckHash: hash,
+        ).catchError((_) {
+          return <String, dynamic>{};
+        });
+      }
+    } catch (_) {}
+
+    cardManager.onRoundCompleted = (announcements, obtained) async {
+      final roomId = gameSession.roomId ?? '';
+      if (roomId.isEmpty) return;
+      try {
+        await GameApiService.instance.saveRound(
+          roomId: roomId,
+          roundNumber: gameSession.currentRound + 1,
+          announcements: announcements,
+          obtainedTricks: obtained,
+        );
+      } catch (_) {}
+    };
+
+    // ✅ Le backend garantit désormais qu'au moins un pique est présent pour chaque joueur.
+    // Nous pouvons donc démarrer directement la phase d'annonces côté client.
+    cardManager.isAnnouncementPhase = true;
+    
+    // ✅ Déterminer le premier joueur à annoncer (même logique pour tous)
+    // Le premier joueur de la liste commence toujours
+    final firstPlayer = playerNames.isNotEmpty ? playerNames.first : widget.currentPlayerName;
+    cardManager.currentPlayerTurn = firstPlayer;
+    
+    print('✅ Jeu configuré, phase d\'annonces démarrée');
+    print('   Premier joueur à annoncer: $firstPlayer');
+    print('   Joueur actuel: ${widget.currentPlayerName}');
+    print('   Trick vidé: ${cardManager.currentTrick.isEmpty}');
+    
+    if (mounted) {
+      setState(() {});
+    }
+    
+    // ✅ NOUVEAU: Les bots annonceront automatiquement après réception de announcement_phase_started
+    // (géré dans le listener _announcementPhaseStartedSubscription)
+    
+    // ✅ Démarrer le timer d'annonce pour le premier joueur (obtient le tour depuis le backend)
+    super.startAnnouncementTimerForCurrentPlayer().then((_) {
+      hasGameStarted = true;
+    });
+  }
+
+  // Surcharger playCard pour ajouter l'envoi WebSocket
+  @override
+  Future<void> playCard(Map<String, dynamic> card) async {
+    // ✅ Vérifier si le joueur est déjà en train de jouer (protection contre les clics multiples)
+    if (currentPlayerPlaying != null) {
+      print('⚠️ Le joueur est déjà en train de jouer, ignorer le clic');
+      return;
+    }
+    
+    // ✅ Appeler la méthode de base (qui fera la validation puis le verrouillage)
+    await super.playCard(card);
+  }
+
+
+  // Surcharger sendRoundCompletedViaWebSocket pour envoyer via WebSocket
+  @override
+  void sendRoundCompletedViaWebSocket(
+    int roundNumber,
+    Map<String, int> announcedByPlayer,
+    Map<String, int> obtainedByPlayer,
+    Map<String, int> scores,
+  ) {
+    final roomId = gameSession.roomId;
+    if (roomId != null && roomId.isNotEmpty && isWebSocketConnected) {
+      try {
+        final wsService = GameWebSocketService();
+        if (wsService.isConnected) {
+          wsService.roundCompleted(
+            roundNumber,
+            scores,
+            announcedByPlayer: announcedByPlayer,
+            obtainedByPlayer: obtainedByPlayer,
+          ).catchError((e) {
+            print('⚠️ Erreur WebSocket lors de l\'envoi de round_completed: $e');
+          });
+          print('📤 Envoi round_completed via WebSocket: round=$roundNumber, scores=$scores');
+        }
+      } catch (e) {
+        print('⚠️ Erreur lors de l\'envoi de round_completed via WebSocket: $e');
+      }
+    }
+  }
+
+  // Surcharger sendAnnouncementViaWebSocket pour envoyer via WebSocket
+  @override
+  void sendAnnouncementViaWebSocket(int announcement, {String? playerName}) {
+    final roomId = gameSession.roomId;
+    if (roomId != null && roomId.isNotEmpty && isWebSocketConnected) {
+      try {
+        final wsService = GameWebSocketService();
+        if (wsService.isConnected) {
+          // ✅ Utiliser playerName si fourni (pour les bots), sinon utilise le joueur actuel
+          wsService.makeAnnouncement(announcement, playerName: playerName).catchError((e) {
+            print('⚠️ Erreur WebSocket lors de l\'envoi de l\'annonce: $e');
+          });
+          print('📤 Annonce envoyée via WebSocket: ${playerName ?? widget.currentPlayerName} → $announcement plis');
+        }
+      } catch (e) {
+        print('⚠️ Erreur lors de l\'envoi de l\'annonce via WebSocket: $e');
+      }
+    }
+  }
+
+  // Surcharger sendAnnouncementTimeoutViaWebSocket pour envoyer via WebSocket
+  @override
+  void sendAnnouncementTimeoutViaWebSocket(String playerName) {
+    // ✅ CORRECTION: Envoyer l'annonce timeout pour tous les joueurs (pas seulement le local)
+    // Car le timeout peut assigner 2 plis à n'importe quel joueur qui n'a pas annoncé
+    final roomId = gameSession.roomId;
+    if (roomId != null && roomId.isNotEmpty && isWebSocketConnected) {
+      try {
+        final wsService = GameWebSocketService();
+        if (wsService.isConnected) {
+          // ✅ Passer le nom du joueur pour que le backend sache qui fait l'annonce
+          wsService.makeAnnouncement(2, playerName: playerName).catchError((e) {
+            print('⚠️ Erreur WebSocket lors de l\'envoi de l\'annonce timeout pour $playerName: $e');
+          });
+          print('📤 Annonce timeout (2 plis) envoyée via WebSocket pour $playerName');
+        }
+      } catch (e) {
+        print('⚠️ Erreur lors de l\'envoi de l\'annonce timeout via WebSocket pour $playerName: $e');
+      }
+    }
+  }
+
+  void _initializeWebSocketListeners() {
+    final wsService = GameWebSocketService();
+    
+    if (!wsService.isConnected) {
+      wsService.connect().then((_) {
+        final roomId = gameSession.roomId;
+        final playerName = widget.currentPlayerName;
+        if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
+          wsService.joinRoom(roomId, playerName).catchError((error) {
+            print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
+          });
+        }
+      }).catchError((error) {
+        print('⚠️ Impossible de se connecter au WebSocket: $error');
+      });
+    } else {
+      final roomId = gameSession.roomId;
+      final playerName = widget.currentPlayerName;
+      if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
+        wsService.joinRoom(roomId, playerName).catchError((error) {
+          print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
+        });
+      }
+    }
+    setState(() {
+      isWebSocketConnected = wsService.isConnected;
+    });
+
+    wsConnectSubscription = wsService.onConnect().listen((_) {
+      if (!mounted) return;
+      setState(() {
+        isWebSocketConnected = true;
+      });
+      final roomId = gameSession.roomId;
+      final playerName = widget.currentPlayerName;
+      if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
+        wsService.joinRoom(roomId, playerName).catchError((error) {
+          print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
+        });
+      }
+      _startStateSyncPolling(forceRestart: true);
+    });
+
+    wsDisconnectSubscription = wsService.onDisconnect().listen((_) {
+      if (!mounted) return;
+      setState(() {
+        isWebSocketConnected = false;
+      });
+      _startStateSyncPolling(forceRestart: true);
+    });
+
+    wsErrorSubscription = wsService.onError().listen((error) {
+      if (!mounted) return;
+      setState(() {
+        isWebSocketConnected = false;
+      });
+      _startStateSyncPolling(forceRestart: true);
+    });
+
+    // ✅ NOUVEAU: Écouter la distribution de cartes
+    _cardDistributionSubscription = wsService.onCardDistribution().listen((data) {
+      if (!mounted) return;
+      
+      print('📥 Événement card_distribution reçu: $data');
+      
+      final distribution = data['distribution'] as Map<String, dynamic>?;
+      final roundNumber = data['round_number'] as int?;
+      final roomId = data['roomId'] as String?;
+      
+      if (distribution == null) {
+        print('⚠️ Distribution null dans l\'événement');
+        return;
+      }
+      
+      if (roomId != null && roomId != gameSession.roomId) {
+        print('⚠️ Room ID ne correspond pas: $roomId vs ${gameSession.roomId}');
+        return;
+      }
+      
+      // ✅ Vérifier si c'est le créateur qui reçoit sa propre distribution
+      final isCreator = gameSession.players.any(
+        (p) => (p['name'] as String?) == widget.currentPlayerName &&
+            (p['isCreator'] as bool?) == true,
+      );
+      
+      // ✅ Si c'est le créateur et qu'il a déjà ses cartes, ignorer la distribution reçue
+      if (isCreator) {
+        final currentPlayerCards = cardManager.getPlayerCards(widget.currentPlayerName);
+        if (currentPlayerCards.isNotEmpty) {
+          print('ℹ️ Créateur: distribution déjà appliquée localement, ignore la distribution WebSocket');
+          // ✅ Mais s'assurer que les autres joueurs ont bien leurs cartes dans la distribution
+          // et configurer le jeu quand même
+          final playerNames = gameSession.players
+              .map((p) => p['name'] as String? ?? 'Joueur')
+              .toList();
+          _configureGameAfterDistribution(playerNames);
+          return;
+        }
+      }
+      
+      print('📥 Distribution reçue pour le round $roundNumber');
+      print('   Joueurs dans la distribution: ${distribution.keys.toList()}');
+      
+      // ✅ Mettre à jour currentRound à chaque nouvelle distribution
+      if (roundNumber != null && roundNumber > 0) {
+        final oldRound = gameSession.currentRound;
+        gameSession.currentRound = roundNumber;
+        print('✅ currentRound mis à jour: $oldRound → $roundNumber');
+      }
+      
+      // ✅ Appliquer la distribution reçue
+      final playerNames = gameSession.players
+          .map((p) => p['name'] as String? ?? 'Joueur')
+          .toList();
+      
+      // Réinitialiser le manager
+      cardManager.resetRoundCounters();
+      // ✅ S'assurer que le trick est bien vidé (double sécurité)
+      cardManager.clearCurrentTrick();
+      
+      // ✅ VALIDATION: Vérifier que toutes les 52 cartes sont distribuées et qu'il n'y a pas de doublons
+      final Set<String> allDistributedCards = {};
+      final Map<String, List<String>> playerCardLists = {};
+      int totalCardsDistributed = 0;
+      
+      for (final entry in distribution.entries) {
+        final playerName = entry.key as String;
+        final cardCodes = (entry.value as List).cast<String>();
+        playerCardLists[playerName] = cardCodes;
+        totalCardsDistributed += cardCodes.length;
+        
+        // ✅ Vérifier les doublons pour ce joueur
+        final uniqueCardsForPlayer = cardCodes.toSet();
+        if (cardCodes.length != uniqueCardsForPlayer.length) {
+          print('❌ ERREUR CRITIQUE: Doublons détectés pour $playerName!');
+          print('   Cartes: $cardCodes');
+          final duplicates = <String, int>{};
+          for (final code in cardCodes) {
+            duplicates[code] = (duplicates[code] ?? 0) + 1;
+          }
+          duplicates.removeWhere((key, value) => value == 1);
+          print('   Doublons: $duplicates');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Erreur: Doublons détectés pour $playerName. Distribution invalide.'),
+                backgroundColor: Colors.red,
+                duration: const Duration(seconds: 5),
+                behavior: SnackBarBehavior.floating,
+                margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              ),
+            );
+          }
+          return; // ❌ NE PAS APPLIQUER cette distribution invalide
+        }
+        
+        // ✅ Vérifier les doublons entre joueurs
+        for (final code in cardCodes) {
+          if (allDistributedCards.contains(code)) {
+            print('❌ ERREUR CRITIQUE: Carte $code distribuée à plusieurs joueurs!');
+            // Trouver quel autre joueur a cette carte
+            for (final otherEntry in playerCardLists.entries) {
+              if (otherEntry.key != playerName && otherEntry.value.contains(code)) {
+                print('   Carte $code également distribuée à: ${otherEntry.key}');
+              }
+            }
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Erreur: Carte $code distribuée à plusieurs joueurs!'),
+                  backgroundColor: Colors.red,
+                  duration: const Duration(seconds: 5),
+                  behavior: SnackBarBehavior.floating,
+                  margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                ),
+              );
+            }
+            return; // ❌ NE PAS APPLIQUER cette distribution invalide
+          }
+          allDistributedCards.add(code);
+        }
+      }
+      
+      // ✅ Vérifier que toutes les 52 cartes sont distribuées
+      if (totalCardsDistributed != 52) {
+        print('❌ ERREUR CRITIQUE: Nombre total de cartes incorrect!');
+        print('   Attendu: 52 cartes');
+        print('   Reçu: $totalCardsDistributed cartes');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Erreur: Nombre de cartes incorrect ($totalCardsDistributed/52).'),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 5),
+              behavior: SnackBarBehavior.floating,
+              margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            ),
+          );
+        }
+        return; // ❌ NE PAS APPLIQUER cette distribution invalide
+      }
+      
+      print('✅ Validation réussie: 52 cartes distribuées, aucune carte en commun entre joueurs');
+      print('   Total cartes: $totalCardsDistributed');
+      print('   Joueurs: ${distribution.keys.toList()}');
+      
+      // ✅ Appliquer la distribution validée
+      bool hasCurrentPlayerCards = false;
+      for (final entry in distribution.entries) {
+        final playerName = entry.key as String;
+        final cardCodes = (entry.value as List).cast<String>();
+        
+        print('📥 Distribution pour "$playerName": ${cardCodes.length} cartes');
+        print('   Joueur actuel: "${widget.currentPlayerName}"');
+        print('   Correspondance: ${playerName == widget.currentPlayerName}');
+        
+        // Construire les cartes à partir des codes
+        final cards = cardCodes.map((code) {
+          return LocalCardManager.instance.getCardByCode(code) ?? {
+            'code': code,
+            'value': code.substring(0, 1),
+            'suit': code.substring(1),
+          };
+        }).toList();
+        
+        // ✅ Assigner les cartes au joueur
+        cardManager.setPlayerCards(playerName, cards);
+        
+        // ✅ Vérifier que les cartes ont bien été assignées
+        final assignedCards = cardManager.getPlayerCards(playerName);
+        print('   ✅ Cartes assignées: ${assignedCards.length} cartes');
+        
+        if (playerName == widget.currentPlayerName) {
+          hasCurrentPlayerCards = true;
+          print('   👤 C\'est le joueur actuel - cartes devraient être visibles');
+          // ✅ Vérifier immédiatement après assignation
+          final verifyCards = cardManager.getPlayerCards(widget.currentPlayerName);
+          print('   🔍 Vérification: ${verifyCards.length} cartes pour le joueur actuel');
+        }
+      }
+      
+      // ✅ Vérifier que le joueur actuel a bien reçu ses cartes
+      if (!hasCurrentPlayerCards) {
+        print('⚠️ ATTENTION: Le joueur actuel (${widget.currentPlayerName}) n\'a pas de cartes dans la distribution reçue');
+        print('   Joueurs dans la distribution: ${distribution.keys.toList()}');
+      }
+      
+      // ✅ Forcer la mise à jour de l'UI pour afficher les cartes
+      if (mounted) {
+        setState(() {
+          // ✅ Marquer que le jeu a démarré pour éviter les demandes de redistribution
+          hasGameStarted = true;
+        });
+        print('✅ setState appelé après distribution - UI devrait être mise à jour');
+        print('✅ Jeu marqué comme démarré (hasGameStarted = true)');
+      }
+      
+      // ✅ Configurer le jeu
+      _configureGameAfterDistribution(playerNames);
+    });
+
+    playerReplacedSubscription = wsService.onPlayerReplaced().listen((data) {
+      if (mounted) {
+        final playerName = data['player_name'] as String?;
+        final botName = data['bot_name'] as String?;
+        final isPermanent = (data['is_permanent'] as bool?) ?? false;
+
+        if (playerName != null && botName != null) {
+          if (playerName != widget.currentPlayerName) {
+            _synchronizePlayerReplacement(playerName, botName, isPermanent);
+          } else if (isPermanent) {
+            permanentlyExcludedPlayers.add(playerName);
+            if (mounted) {
+              super.showPlayerExcludedDialog();
+            }
+          }
+        }
+      }
+    });
+
+    playerRestoredSubscription = wsService.onPlayerRestored().listen((data) {
+      if (mounted) {
+        final playerName = data['player_name'] as String?;
+        final botName = data['bot_name'] as String?;
+
+        if (playerName != null && botName != null) {
+          if (playerName != widget.currentPlayerName) {
+            _synchronizePlayerRestoration(playerName, botName);
+          } else {
+            temporaryReplacements.remove(playerName);
+          }
+        }
+      }
+    });
+
+    playerDisconnectedSubscription = wsService.onPlayerDisconnected().listen((data) {
+      if (mounted) {
+        final playerName = data['player_name'] as String?;
+        final roomId = data['room_id'] as String?;
+
+        if (playerName != null && roomId == gameSession.roomId) {
+          if (playerName != widget.currentPlayerName &&
+              !temporaryReplacements.containsKey(playerName)) {
+            _handlePlayerDisconnection(playerName);
+          }
+        }
+      }
+    });
+
+    playerReconnectedSubscription = wsService.onPlayerReconnected().listen((data) {
+      if (mounted) {
+        final playerName = data['player_name'] as String?;
+        final canRestore = (data['can_restore'] as bool?) ?? false;
+        final roomId = data['room_id'] as String?;
+
+        if (playerName != null && roomId == gameSession.roomId) {
+          if (canRestore && temporaryReplacements.containsKey(playerName)) {
+            _handlePlayerReconnection(playerName);
+          } else if (!canRestore) {
+            if (temporaryReplacements.containsKey(playerName)) {
+              temporaryReplacements[playerName]!['isPermanent'] = true;
+              permanentlyExcludedPlayers.add(playerName);
+            }
+          }
+        }
+      }
+    });
+
+    announcementMadeSubscription = wsService.onAnnouncementMade().listen((data) async {
+      if (mounted) {
+        final playerName = data['playerName'] as String? ?? data['player_name'] as String?;
+        final announcement = data['announcement'] as int?;
+        final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+
+        // ✅ Accepter TOUS les messages d'annonce (y compris ceux de l'expéditeur)
+        // pour garantir la synchronisation complète
+        if (playerName != null && 
+            announcement != null && 
+            roomId == gameSession.roomId) {
+          print('📡 Annonce reçue via WebSocket: $playerName → $announcement plis');
+          
+          // ✅ Vérifier si l'annonce n'existe pas déjà (éviter les doublons)
+          final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
+          final alreadyExists = existingAnnouncements.any(
+            (ann) => ann['player'] == playerName,
+          );
+          
+          if (!alreadyExists) {
+            print('   ✅ Ajout de l\'annonce pour $playerName: $announcement plis');
+            cardManager.makeAnnouncement(playerName, announcement);
+            
+            // ✅ Vérifier que l'annonce a bien été ajoutée
+            final updatedAnnouncements = cardManager.getCurrentRoundAnnouncements();
+            print('   📊 Annonces après ajout: ${updatedAnnouncements.length}');
+            for (var ann in updatedAnnouncements) {
+              print('      - ${ann['player']}: ${ann['announcement']} plis');
+            }
+            
+            // ✅ Forcer la mise à jour de l'UI pour tous les joueurs
+            // ⚠️ IMPORTANT: Ne pas réinitialiser _currentAnnouncementPlayer ici
+            // pour que le panneau reste stable pendant les 30 secondes
+            if (mounted) {
+              setState(() {
+                // Mettre à jour l'interface - cela déclenchera la reconstruction
+                // de tous les widgets qui utilisent getPlayerAnnouncementDisplay
+                // Mais _currentAnnouncementPlayer reste inchangé pour maintenir le panneau stable
+              });
+              print('   ✅ setState() appelé pour mettre à jour les compteurs d\'annonces');
+              print('   📊 Annonce synchronisée en temps réel: $playerName → $announcement plis');
+            }
+          } else {
+            print('⚠️ Annonce déjà existante pour $playerName, ignorée');
+          }
+          
+          // ✅ NOUVEAU: Vérifier avec le backend si toutes les annonces sont faites
+          try {
+            final gameId = await getGameId();
+            final roundNumber = gameSession.currentRound;
+            
+            if (gameId != null) {
+              final turnData = await GameApiService.instance.getAnnouncementTurn(
+                gameId: gameId,
+                roundNumber: roundNumber,
+              );
+              
+              if (turnData['all_announced'] == true) {
+                print('✅ Toutes les annonces sont terminées (backend), passage à la phase de jeu');
+                super.handleAnnouncementTurnComplete();
+                return;
+              }
+            }
+          } catch (e) {
+            print('⚠️ Erreur lors de la vérification du tour depuis le backend: $e');
+            // Fallback: vérification locale
+            final playerNames = gameSession.players
+                .map((player) => player['name'] as String? ?? 'Joueur')
+                .toList();
+            if (cardManager.areAllAnnouncementsDone(playerNames)) {
+              print('✅ Toutes les annonces sont terminées (local), passage à la phase de jeu');
+              super.handleAnnouncementTurnComplete();
+            }
+          }
+        } else {
+          print('⚠️ Annonce reçue mais conditions non remplies:');
+          if (playerName == null) print('      - playerName est null');
+          if (announcement == null) print('      - announcement est null');
+          if (roomId != gameSession.roomId) print('      - roomId ne correspond pas: $roomId vs ${gameSession.roomId}');
+        }
+      }
+    });
+
+    // ✅ NOUVEAU: Écouter l'événement de fin des annonces depuis le backend (ancien système)
+    _allAnnouncementsCompletedSubscription = wsService.onAllAnnouncementsCompleted().listen((data) {
+      if (!mounted) return;
+      
+      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+      final roundNumber = data['round_number'] as int?;
+      final announcements = data['announcements'] as Map<String, dynamic>?;
+      
+      if (roomId == gameSession.roomId && roundNumber == gameSession.currentRound) {
+        print('✅ Toutes les annonces sont terminées (événement backend)');
+        
+        // Synchroniser les annonces depuis le backend
+        if (announcements != null) {
+          for (final entry in announcements.entries) {
+            final playerName = entry.key as String;
+            final announcement = (entry.value as num?)?.toInt() ?? 0;
+            
+            // Vérifier si l'annonce n'existe pas déjà
+            final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
+            final alreadyExists = existingAnnouncements.any(
+              (ann) => ann['player'] == playerName,
+            );
+            
+            if (!alreadyExists) {
+              cardManager.makeAnnouncement(playerName, announcement);
+            }
+          }
+        }
+        
+        // Passer à la phase de jeu
+        super.handleAnnouncementTurnComplete();
+      }
+    });
+
+    // ✅ NOUVEAU: Écouter l'événement de démarrage de la phase d'annonces simultanée
+    _announcementPhaseStartedSubscription = wsService.onAnnouncementPhaseStarted().listen((data) {
+      if (!mounted) return;
+      
+      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+      final roundNumber = data['round_number'] as int?;
+      final startTimestamp = data['start_timestamp'] as int?;
+      final duration = data['duration'] as int? ?? 30;
+      final gameId = data['game_id'] as int?; // ✅ Récupérer le game_id depuis l'événement
+      
+      if (roomId == gameSession.roomId && roundNumber == gameSession.currentRound && startTimestamp != null) {
+        print('🎬 Phase d\'annonces simultanée démarrée: round=$roundNumber, start=$startTimestamp, duration=$duration, game_id=$gameId');
+        
+        // Stocker les informations de la phase
+        _announcementPhaseStartTimestamp = startTimestamp;
+        _announcementPhaseDuration = duration;
+        _currentGameId = gameId; // ✅ Stocker le game_id pour les annonces
+        _hasAnnounced = false; // Réinitialiser pour ce round
+        
+        // Démarrer le minuteur basé sur le timestamp serveur
+        _startAnnouncementPhaseTimer(startTimestamp, duration);
+        
+        // Afficher le panneau pour tous les joueurs
+        if (mounted) {
+          setState(() {
+            cardManager.isAnnouncementPhase = true;
+          });
+        }
+        
+        // ✅ Faire annoncer automatiquement tous les bots après 10 secondes de la phase
+        // ⚠️ Augmenté à 10 secondes pour laisser le temps au cache backend d'être créé
+        Future.delayed(const Duration(seconds: 10), () async {
+          if (!mounted || !cardManager.isAnnouncementPhase) return;
+          
+          final allPlayers = gameSession.players;
+          final bots = allPlayers.where((p) {
+            final isBotValue = p['is_bot'];
+            return isBotValue == true || isBotValue == 1 || (isBotValue is String && isBotValue == '1');
+          }).toList();
+          
+          print('🤖 ${bots.length} bots détectés, annonces automatiques en cours après 10 secondes...');
+          
+          // Faire annoncer chaque bot avec un petit délai progressif pour éviter les conflits
+          for (int i = 0; i < bots.length; i++) {
+            final bot = bots[i];
+            final botName = bot['name'] as String? ?? 'Joueur';
+            
+            Future.delayed(Duration(milliseconds: 300 + (i * 400)), () async {
+              if (!mounted || !cardManager.isAnnouncementPhase) return;
+              
+              // Vérifier si le bot a déjà fait son annonce
+              final announcements = cardManager.getCurrentRoundAnnouncements();
+              final alreadyAnnounced = announcements.any(
+                (ann) => ann['player'] == botName,
+              );
+              
+              if (!alreadyAnnounced) {
+                // ✅ Fonction avec retry pour garantir l'envoi au backend
+                await _sendBotAnnouncementWithRetry(botName);
+              } else {
+                print('⚠️ $botName a déjà fait son annonce, ignoré');
+              }
+            });
+          }
+        });
+      }
+    });
+
+    // ✅ NOUVEAU: Écouter les soumissions d'annonces en temps réel
+    _announcementSubmittedSubscription = wsService.onAnnouncementSubmitted().listen((data) {
+      if (!mounted) return;
+      
+      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+      final roundNumber = data['round_number'] as int?;
+      final playerName = data['playerName'] as String? ?? data['player_pseudo'] as String?;
+      final announcement = data['announcement'] as int? ?? data['announcement_value'] as int?;
+      final submittedCount = data['submitted_count'] as int?;
+      
+      if (roomId == gameSession.roomId && 
+          roundNumber == gameSession.currentRound && 
+          playerName != null && 
+          announcement != null) {
+        print('📡 Annonce soumise: $playerName → $announcement plis (total: $submittedCount/4)');
+        
+        // Synchroniser l'annonce localement
+        final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
+        final alreadyExists = existingAnnouncements.any(
+          (ann) => ann['player'] == playerName,
+        );
+        
+        if (!alreadyExists) {
+          cardManager.makeAnnouncement(playerName, announcement);
+          
+          // Mettre à jour l'UI
+          if (mounted) {
+            setState(() {});
+          }
+        }
+      }
+    });
+
+    // ✅ NOUVEAU: Écouter l'événement de fin des annonces (système simultané)
+    _announcementsCompleteSubscription = wsService.onAnnouncementsComplete().listen((data) {
+      if (!mounted) return;
+      
+      print('📥 Événement announcements_complete reçu: $data');
+      
+      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+      final roundNumber = data['round_number'] as int?;
+      final announcements = data['announcements'] as Map<String, dynamic>?;
+      final firstPlayer = data['first_player'] as String?;
+      
+      print('🔍 Vérification événement announcements_complete:');
+      print('   - roomId reçu: $roomId (type: ${roomId.runtimeType})');
+      print('   - roomId session: ${gameSession.roomId} (type: ${gameSession.roomId.runtimeType})');
+      print('   - roundNumber reçu: $roundNumber (type: ${roundNumber.runtimeType})');
+      print('   - roundNumber session: ${gameSession.currentRound} (type: ${gameSession.currentRound.runtimeType})');
+      
+      // ✅ AMÉLIORATION: Comparer les roomId en convertissant en string pour éviter les problèmes de type
+      final roomIdMatch = roomId?.toString() == gameSession.roomId?.toString();
+      final roundNumberMatch = roundNumber == gameSession.currentRound;
+      
+      print('   - Match roomId: $roomIdMatch');
+      print('   - Match roundNumber: $roundNumberMatch');
+      print('   - Match total: ${roomIdMatch && roundNumberMatch}');
+      
+      if (roomIdMatch && roundNumberMatch) {
+        print('✅ Toutes les annonces sont terminées (système simultané)');
+        print('   - Annonces: $announcements');
+        print('   - Premier joueur: $firstPlayer');
+        
+        // Arrêter le timer de la phase
+        _announcementPhaseTimer?.cancel();
+        _announcementPhaseStartTimestamp = null;
+        _currentGameId = null; // ✅ Réinitialiser le game_id
+        
+        // Synchroniser les annonces depuis le backend
+        if (announcements != null) {
+          final players = gameSession.players
+              .map((p) => p['name'] as String? ?? 'Joueur')
+              .toList();
+          
+          // ✅ Construire la liste des annonces dans l'ordre des joueurs pour gameSession
+          final announcementsList = <int>[];
+          
+          for (final entry in announcements.entries) {
+            final playerName = entry.key as String;
+            final announcement = (entry.value as num?)?.toInt() ?? 0;
+            
+            // Vérifier si l'annonce n'existe pas déjà
+            final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
+            final alreadyExists = existingAnnouncements.any(
+              (ann) => ann['player'] == playerName,
+            );
+            
+            if (!alreadyExists) {
+              print('   - Ajout annonce: $playerName → $announcement');
+              cardManager.makeAnnouncement(playerName, announcement);
+            } else {
+              print('   - Annonce déjà existante: $playerName → $announcement');
+            }
+          }
+          
+          // ✅ CRITIQUE: Mettre à jour gameSession.roundsData pour afficher la ligne R1 dans le tableau
+          // Construire la liste des annonces dans l'ordre des joueurs
+          for (final playerName in players) {
+            final announcement = (announcements[playerName] as num?)?.toInt() ?? 0;
+            announcementsList.add(announcement);
+          }
+          
+          // ✅ Ajouter le round actuel dans gameSession pour qu'il apparaisse dans le tableau de scores
+          // IMPORTANT: Utiliser addCurrentRound() pour ne PAS incrémenter currentRound
+          // car on doit rester au round actuel pour jouer les cartes
+          if (announcementsList.length == players.length) {
+            print('   - Ajout du round ${gameSession.currentRound} dans gameSession avec annonces: $announcementsList');
+            gameSession.addCurrentRound(announcementsList);
+            
+            // ✅ Forcer la mise à jour de l'UI pour que le tableau de scores soit visible
+            if (mounted) {
+              setState(() {
+                // Le tableau de scores sera mis à jour automatiquement via gameSession.roundsData
+              });
+            }
+          }
+        }
+        
+        // ✅ CORRECTION: Ne PAS mettre isAnnouncementPhase = false ici
+        // handleAnnouncementTurnComplete() doit le faire via startGamePhase()
+        // pour que la vérification dans handleAnnouncementTurnComplete() fonctionne
+        
+        // ✅ Stocker le firstPlayer du backend pour l'utiliser dans handleAnnouncementTurnComplete()
+        // On va le passer via une variable de classe ou directement dans la méthode
+        final backendFirstPlayer = firstPlayer;
+        
+        // ✅ Démarrer le jeu - handleAnnouncementTurnComplete() va :
+        // 1. Vérifier que isAnnouncementPhase est true
+        // 2. Appeler startGamePhase() qui met isAnnouncementPhase = false
+        // 3. Définir le premier joueur pour la phase de jeu
+        print('   - Appel handleAnnouncementTurnComplete() avec firstPlayer: $backendFirstPlayer');
+        
+        // ✅ CORRECTION: L'événement announcements_complete du backend garantit que toutes les annonces sont faites
+        // On peut donc forcer le démarrage de la phase de jeu même si areAllAnnouncementsDone() retourne false
+        // (cela peut arriver si la synchronisation locale n'est pas encore complète)
+        
+        final playerNames = gameSession.players
+            .map((p) => p['name'] as String? ?? 'Joueur')
+            .toList();
+        
+        // ✅ DEBUG: Vérifier l'état des annonces
+        final currentAnnouncements = cardManager.getCurrentRoundAnnouncements();
+        print('🔍 Vérification annonces avant démarrage phase de jeu:');
+        print('   - Nombre d\'annonces locales: ${currentAnnouncements.length}');
+        print('   - Nombre de joueurs: ${playerNames.length}');
+        for (final playerName in playerNames) {
+          final hasAnnounced = currentAnnouncements.any((ann) => ann['player'] == playerName);
+          final announcement = currentAnnouncements.firstWhere(
+            (ann) => ann['player'] == playerName,
+            orElse: () => <String, Object>{'announcement': 0},
+          )['announcement'] as int? ?? 0;
+          print('   - $playerName: ${hasAnnounced ? "✅ $announcement plis" : "❌ pas d\'annonce"}');
+        }
+        
+        // ✅ S'assurer que toutes les annonces du backend sont bien synchronisées localement
+        if (announcements != null) {
+          for (final entry in announcements.entries) {
+            final playerName = entry.key as String;
+            final announcement = (entry.value as num?)?.toInt() ?? 0;
+            final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
+            final alreadyExists = existingAnnouncements.any(
+              (ann) => ann['player'] == playerName,
+            );
+            if (!alreadyExists) {
+              print('   - Synchronisation manquante: ajout annonce $playerName → $announcement');
+              cardManager.makeAnnouncement(playerName, announcement);
+            }
+          }
+        }
+        
+        // ✅ Maintenant vérifier que toutes les annonces sont bien là
+        final allAnnounced = cardManager.areAllAnnouncementsDone(playerNames);
+        print('   - Toutes les annonces sont faites (après synchronisation): $allAnnounced');
+        
+        // ✅ Démarrer la phase de jeu - l'événement backend garantit que c'est le bon moment
+        print('✅ Démarrage de la phase de jeu (événement backend announcements_complete)');
+        
+        // ✅ Forcer le démarrage même si areAllAnnouncementsDone() retourne false
+        // car l'événement backend est la source de vérité
+        if (!allAnnounced) {
+          print('⚠️ areAllAnnouncementsDone() retourne false, mais l\'événement backend garantit que toutes les annonces sont faites');
+          print('   - Forçage du démarrage de la phase de jeu');
+        }
+        
+        super.handleAnnouncementTurnComplete();
+        
+        // ✅ Après handleAnnouncementTurnComplete(), utiliser le firstPlayer du backend si disponible
+        if (backendFirstPlayer != null && backendFirstPlayer.isNotEmpty && mounted) {
+          Future.delayed(const Duration(milliseconds: 100), () {
+            if (mounted && !cardManager.isAnnouncementPhase) {
+              print('   - Utilisation du premier joueur du backend: $backendFirstPlayer');
+              cardManager.currentPlayerTurn = backendFirstPlayer;
+              setState(() {});
+              
+              // ✅ Démarrer le timer de timeout et le jeu automatique des bots
+              startPlayerTurnTimeout();
+              Future.delayed(const Duration(milliseconds: 500), () {
+                if (mounted && !cardManager.isAnnouncementPhase) {
+                  maybeAutoPlayCurrentBot();
+                }
+              });
+            }
+          });
+        }
+        
+        print('✅ Phase d\'annonces terminée, jeu démarré');
+      } else {
+        print('⚠️ Événement announcements_complete ignoré (roomId ou roundNumber ne correspondent pas)');
+      }
+    });
+
+    roomChatMessageSubscription = wsService.onRoomChatMessage().listen((data) {
+      if (mounted) {
+        final playerName = data['playerName'] as String? ?? data['player_name'] as String?;
+        final message = data['message'] as String?;
+        final messageType = data['message_type'] as String? ?? 'text';
+        final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+        final messageIdRaw = data['id'] ?? data['message_id'] ?? data['messageId'];
+        final messageId = _normalizeMessageId(messageIdRaw);
+
+        // ✅ LOG: Réception d'un message via WebSocket
+        print('📥 RÉCEPTION MESSAGE CHAT VIA WEBSOCKET');
+        print('   Expéditeur reçu: $playerName');
+        print('   Expéditeur actuel: ${widget.currentPlayerName}');
+        print('   Est l\'expéditeur: ${playerName == widget.currentPlayerName}');
+        print('   Message: $message');
+        print('   RoomId reçu: $roomId');
+        print('   RoomId actuel: ${gameSession.roomId}');
+        print('   MessageId: $messageId');
+
+        // ✅ TRAITEMENT SPÉCIAL: Message système "REDISTRIBUTE_CARDS"
+        if (message == 'REDISTRIBUTE_CARDS' && messageType == 'system') {
+          // ✅ Seul le créateur peut redistribuer les cartes
+          final isCreator = gameSession.players.any(
+            (p) => (p['name'] as String?) == widget.currentPlayerName &&
+                (p['isCreator'] as bool?) == true,
+          );
+          
+          if (isCreator && mounted) {
+            print('🔄 Message REDISTRIBUTE_CARDS reçu - Redistribution des cartes par le créateur');
+            // Ne pas ajouter ce message au chat, c'est un message système
+            // Redistribuer les cartes seulement si le jeu n'a pas encore démarré
+            // ou si c'est une nouvelle manche
+            Future.delayed(const Duration(milliseconds: 500), () {
+              if (mounted) {
+                try {
+                  // ✅ Vérifier que le jeu n'est pas en cours (sauf si c'est une nouvelle manche)
+                  final playerCards = cardManager.getPlayerCards(widget.currentPlayerName);
+                  if (playerCards.isEmpty || !hasGameStarted) {
+                    print('✅ Redistribution autorisée (cartes vides ou jeu non démarré)');
+                    startCardDistribution();
+                  } else {
+                    print('⚠️ Redistribution ignorée: le jeu a déjà démarré et le joueur a des cartes');
+                  }
+                } catch (e) {
+                  print('❌ Erreur lors de la redistribution: $e');
+                }
+              }
+            });
+            return; // Ne pas traiter comme un message de chat normal
+          } else {
+            print('ℹ️ Message REDISTRIBUTE_CARDS ignoré (pas le créateur ou widget non monté)');
+            return; // Ignorer si ce n'est pas le créateur
+          }
+        }
+        
+        // ✅ Accepter TOUS les messages (y compris ceux de l'expéditeur) pour garantir la visibilité
+        // La déduplication sera gérée par _ingestChatMessages via _knownChatMessageIds
+        if (playerName != null && 
+            message != null && 
+            roomId == gameSession.roomId) {
+          print('   ✅ Conditions remplies, ajout du message...');
+          final messageData = <String, dynamic>{
+            'id': messageId ?? DateTime.now().millisecondsSinceEpoch,
+            'user_id': null,
+            'pseudo': playerName,
+            'message': message,
+            'message_type': messageType,
+            if (data['preset_code'] != null) 'preset_code': data['preset_code'],
+            'created_at': DateTime.now().toIso8601String(),
+          };
+
+          _ingestChatMessages([messageData]);
+        } else {
+          print('   ❌ Conditions non remplies:');
+          if (playerName == null) print('      - playerName est null');
+          if (message == null) print('      - message est null');
+          if (roomId != gameSession.roomId) print('      - roomId ne correspond pas: $roomId vs ${gameSession.roomId}');
+        }
+      }
+    });
+
+  /// Méthode utilitaire pour ajouter un log de débogage (pour l'UI et la console)
+  void _addDebugLog(String log) {
+    if (!kDebugMode) return;
+
+    final timestamp = DateTime.now().toIso8601String().substring(11, 23); // HH:mm:ss.sss
+
+    final formattedLog = '[$timestamp] $log';
+
+    if (mounted) {
+      setState(() {
+        _debugLogs.insert(0, formattedLog); // Ajouter au début
+        if (_debugLogs.length > _maxLogs) {
+          _debugLogs.removeLast(); // Maintenir la taille max
+        }
+      });
+    }
+  }
+
+  /// Implémentation de la méthode abstraite:
+  /// Récupère la liste des codes de cartes jouables pour le joueur actuel depuis le backend.
+  @override
+  Future<void> _updatePlayableCardsFromBackend({bool force = false}) async {
+    if (_isUpdatingPlayableCards && !force) {
+      _addDebugLog('⚠️ Déjà en cours de mise à jour des cartes jouables (force=false). Ignoré.');
+      return;
+    }
+    _addDebugLog('🔄 Début de la mise à jour des cartes jouables (force=$force)...');
+    
+    setState(() {
+      _isUpdatingPlayableCards = true;
+    });
+
+    final currentRoomId = gameSession.roomId;
+    if (currentRoomId == null || currentRoomId.isEmpty) {
+      _addDebugLog('❌ Room ID est null/vide. Impossible de récupérer les cartes jouables.');
+      setState(() {
+        _isUpdatingPlayableCards = false;
+      });
+      return;
+    }
+
+    try {
+      // Obtenir les IDs nécessaires pour l'API
+      final gameId = await getGameId();
+      final roundId = await getRoundIdForCurrentRound();
+      final trickId = await getTrickIdForCurrentTrick();
+      final playerId = await getPlayerId(widget.currentPlayerName);
+      
+      if (gameId != null && roundId != null && trickId != null && playerId != null) {
+        final playableCardCodesList = await GameApiService.instance.getPlayableCards(
+          gameId: gameId,
+          roundId: roundId,
+          trickId: trickId,
+          playerId: playerId,
+        );
+        
+        final playableCardCodes = playableCardCodesList.toSet();
+        final message = '✅ Cartes jouables mises à jour : ${playableCardCodes.length} cartes. Codes: ${playableCardCodes.take(5).join(', ')}...';
+        _addDebugLog(message);
+        print(message); // Console log
+
+        setState(() {
+          _playableCardCodes = playableCardCodes;
+          _isUpdatingPlayableCards = false;
+        });
+      } else {
+        final errorMsg = '❌ IDs non disponibles (gameId=$gameId, roundId=$roundId, trickId=$trickId, playerId=$playerId)';
+        _addDebugLog(errorMsg);
+        print(errorMsg);
+        setState(() {
+          _playableCardCodes.clear();
+          _isUpdatingPlayableCards = false;
+        });
+      }
+    } catch (e) {
+      final errorMsg = '❌ Erreur lors de la récupération des cartes jouables: $e';
+      _addDebugLog(errorMsg);
+      print(errorMsg); // Console log
+      if (mounted) {
+        setState(() {
+          _playableCardCodes.clear();
+          _isUpdatingPlayableCards = false;
+        });
+      }
+    }
+  }
+
+  // ✅ Méthode publique helper pour être accessible dans les closures
+  Future<void> updatePlayableCardsFromBackend() async {
+    return _updatePlayableCardsFromBackend();
+  }
+
+  /// Méthode dédiée pour gérer la fin d'un pli (animation + nettoyage)
+  /// Appelée depuis le listener trick_completed
+  Future<void> _handleTrickEnd(String winnerName, int? trickNumber) async {
+    if (!mounted) return;
+
+    final trickCards = cardManager.currentTrick;
+    final logMsg1 = '🎬 _handleTrickEnd: winner=$winnerName, trick=$trickNumber, cartes=${trickCards.length}';
+    print(logMsg1);
+    _addDebugLog(logMsg1);
+
+    // 1. Mettre à jour l'état du gagnant et préparer l'animation
+    if (mounted) {
+      setState(() {
+        lastTrickWinner = winnerName;
+        isCollectingTrick = false; // Commencer avec l'animation désactivée
+      });
+    }
+
+    if (trickCards.isEmpty) {
+      final logMsg2 = '⚠️ Trick vide - impossible de déclencher l\'animation de collecte';
+      print(logMsg2);
+      _addDebugLog(logMsg2);
+      // Si le trick est vide, on nettoie quand même et on passe au suivant
+      cardManager.clearCurrentTrick();
+      if (mounted) {
+        setState(() {
+          isCollectingTrick = false;
+          lastTrickWinner = null;
+        });
+      }
+      // Passer au joueur suivant si c'est un bot
+      Future.delayed(const Duration(milliseconds: 300), () {
+        if (!mounted) return;
+        final current = cardManager.currentPlayerTurn;
+        if (current.isNotEmpty && current != widget.currentPlayerName) {
+          print('🔄 Appel maybeAutoPlayCurrentBot (trick vide)');
+          maybeAutoPlayCurrentBot();
+        }
+      });
+      return;
+    }
+
+    // ✅ Le trick contient des cartes, on peut déclencher l'animation
+    final expectedPlayerCount = cardManager.expectedPlayerCount;
+    final logMsg3 = '🎬 Démarrage animation collecte vers $winnerName (${trickCards.length}/$expectedPlayerCount cartes)';
+    print(logMsg3);
+    _addDebugLog(logMsg3);
+
+    // 2. ✅ ATTENDRE QUE TOUTES LES CARTES SOIENT PRÉSENTES avant de démarrer l'animation
+    // Cela garantit que les 4 cartes sont visibles au centre avant l'animation de collecte
+    Future<void> startCollectionAnimation() async {
+      int attempts = 0;
+      const maxAttempts = 20; // Maximum 2 secondes d'attente (20 * 100ms)
+      const delayMs = 100;
+      
+      while (attempts < maxAttempts) {
+        if (!mounted) return;
+        
+        final currentTrickSize = cardManager.currentTrick.length;
+        final expectedSize = cardManager.expectedPlayerCount;
+        
+        if (currentTrickSize >= expectedSize) {
+          // ✅ Toutes les cartes sont présentes, démarrer l'animation
+          if (mounted) {
+            setState(() {
+              isCollectingTrick = true; // Active l'animation dans _buildCardAtPosition
+            });
+            final logMsg4 = '🎬 Animation collecte activée (${currentTrickSize}/$expectedSize cartes - TOUTES PRÉSENTES)';
+            print(logMsg4);
+            _addDebugLog(logMsg4);
+            
+            // ✅ Log détaillé des cartes présentes
+            final trickCards = cardManager.currentTrick;
+            print('📋 Cartes dans le trick avant animation:');
+            for (int i = 0; i < trickCards.length; i++) {
+              final play = trickCards[i];
+              final player = play['player'] as String? ?? 'Inconnu';
+              final card = play['card'] as Map<String, dynamic>?;
+              final cardCode = card?['code'] as String? ?? 'N/A';
+              print('   [$i] $player → $cardCode');
+            }
+          }
+          return;
+        }
+        
+        attempts++;
+        if (attempts < maxAttempts) {
+          print('⏳ Attente des cartes manquantes: ${currentTrickSize}/$expectedSize (tentative $attempts/$maxAttempts)');
+          await Future.delayed(Duration(milliseconds: delayMs));
+        }
+      }
+      
+      // ⚠️ Timeout: démarrer l'animation même si toutes les cartes ne sont pas arrivées
+      if (mounted) {
+        final finalTrickSize = cardManager.currentTrick.length;
+        print('⚠️ Timeout: Animation démarrée avec $finalTrickSize/$expectedPlayerCount cartes (certaines cartes manquantes)');
+        setState(() {
+          isCollectingTrick = true;
+        });
+      }
+    }
+    
+    // Démarrer la vérification
+    startCollectionAnimation();
+
+    // 3. Après 1200ms (durée de l'animation), nettoyer le trick et passer au suivant
+    // ✅ Remettre la durée d'animation à 1200ms pour une animation fluide
+    Future.delayed(const Duration(milliseconds: 1200), () {
+      if (!mounted) return;
+      
+      // Vider le trick actuel (les cartes ont été animées vers le gagnant)
+      final trickSizeBeforeClear = cardManager.currentTrick.length;
+      cardManager.clearCurrentTrick();
+      final logMsg5 = '🧹 Trick vidé après animation (${trickSizeBeforeClear} cartes supprimées)';
+      print(logMsg5);
+      _addDebugLog(logMsg5);
+      
+      // Mettre à jour l'UI pour cacher l'animation et réinitialiser les variables
+      if (mounted) {
+        setState(() {
+          isCollectingTrick = false;
+          lastTrickWinner = null;
+        });
+        print('✅ UI mise à jour: animation terminée, trick nettoyé');
+      }
+
+      // 4. Passer au joueur suivant si c'est un bot
+      // ✅ OPTIMISATION: Vérifier si c'est le dernier trick (fin de manche)
+      // Une manche = exactement 13 tricks (4 joueurs × 13 cartes = 52 cartes)
+      // Si currentTrickNumber > 13, c'est la fin de la manche
+      final currentTrickNum = cardManager.currentTrickNumber;
+      if (currentTrickNum > 13) {
+        print('🎉 Dernier trick terminé ! Manche terminée (détecté dans _handleTrickEnd, trick=$currentTrickNum).');
+        // Appeler onRoundCompleted() directement (qui est dans la classe de base)
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (mounted && !cardManager.isAnnouncementPhase) {
+            onRoundCompleted();
+          }
+        });
+        return; // Ne pas continuer avec maybeAutoPlayCurrentBot si la manche est terminée
+      }
+      
+      // ✅ Augmenter le délai pour laisser le temps au backend de créer le nouveau trick
+      Future.delayed(const Duration(milliseconds: 1500), () async {
+        if (!mounted) return;
+        final current = cardManager.currentPlayerTurn;
+        if (current.isNotEmpty && current != widget.currentPlayerName) {
+          print('🔄 Appel maybeAutoPlayCurrentBot après nettoyage trick (délai 1.5s)');
+          
+          // ✅ Vérifier que le nouveau trick est prêt avant de jouer
+          try {
+            final roomId = gameSession.roomId;
+            if (roomId != null && roomId.isNotEmpty) {
+              final roundNumber = gameSession.currentRound;
+              final trickNumber = cardManager.currentTrickNumber > 0 
+                  ? cardManager.currentTrickNumber 
+                  : 1;
+              
+              // Vérifier que le trick est prêt
+              final trickData = await GameApiService.instance.getCurrentTrick(
+                roomId: roomId,
+                roundNumber: roundNumber,
+                trickNumber: trickNumber,
+              );
+              
+              if (trickData['success'] == true) {
+                print('✅ Nouveau trick prêt, le bot peut jouer');
+                maybeAutoPlayCurrentBot();
+              } else {
+                // ✅ Erreur 409 - le trick n'est pas encore prêt, attendre plus longtemps
+                final errorMessage = trickData['message']?.toString() ?? '';
+                if (errorMessage.contains('Trick not ready yet') || errorMessage.contains('409')) {
+                  print('⏳ Trick pas encore prêt (409), attente de 1.5s avant nouvelle tentative...');
+                  Future.delayed(const Duration(milliseconds: 1500), () {
+                    if (mounted) maybeAutoPlayCurrentBot();
+                  });
+                } else {
+                  print('⚠️ Erreur lors de la vérification du trick: $errorMessage');
+                  // Pour les autres erreurs, attendre un peu moins
+                  Future.delayed(const Duration(milliseconds: 500), () {
+                    if (mounted) maybeAutoPlayCurrentBot();
+                  });
+                }
+              }
+          } else {
+            // Si roomId n'est pas disponible, attendre un peu plus et essayer quand même
+            Future.delayed(const Duration(milliseconds: 500), () {
+              if (mounted) maybeAutoPlayCurrentBot();
+            });
+          }
+        } catch (e) {
+          print('⚠️ Erreur lors de la vérification du trick: $e');
+          final errorString = e.toString();
+          // ✅ Si c'est une erreur 409, attendre plus longtemps
+          if (errorString.contains('Trick not ready yet') || errorString.contains('409')) {
+            print('⏳ Trick pas encore prêt (exception 409), attente de 1.5s...');
+            Future.delayed(const Duration(milliseconds: 1500), () {
+              if (mounted) maybeAutoPlayCurrentBot();
+            });
+          } else {
+            // Pour les autres erreurs, attendre un peu moins
+            Future.delayed(const Duration(milliseconds: 500), () {
+              if (mounted) maybeAutoPlayCurrentBot();
+            });
+          }
+        }
+        }
+      });
+    });
+  }
+
+    // ✅ Écouter l'événement trick_completed pour synchroniser le tour ET les compteurs
+    _trickCompletedSubscription = wsService.onTrickCompleted().listen((data) {
+      if (!mounted) return;
+
+      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+      final winnerName = data['winnerName'] as String? ?? data['winner_name'] as String?;
+      final currentTrickNumber = data['currentTrickNumber'] as int? ??
+          data['current_trick_number'] as int?;
+      final nextTrickNumber = data['nextTrickNumber'] as int? ??
+          data['next_trick_number'] as int?;
+      final obtainedTricks = (data['obtainedTricks'] ??
+              data['obtained_tricks']) as Map<String, dynamic>?;
+
+      if (roomId != gameSession.roomId || winnerName == null || winnerName.isEmpty) {
+        return;
+      }
+
+      final logMsg = '📥 Événement trick_completed reçu: winner=$winnerName, trick=$currentTrickNumber';
+      print(logMsg);
+      _addDebugLog(logMsg);
+
+      final currentTrickSize = cardManager.currentTrick.length;
+      final expectedTrickSize = cardManager.expectedPlayerCount;
+      final localTrickNumber = cardManager.currentTrickNumber;
+
+      // ✅ Si le trick est incomplet, attendre un peu pour que les cartes arrivent via WebSocket
+      //    Mais ne pas ignorer complètement l'événement (les compteurs doivent être mis à jour)
+      if (currentTrickSize > 0 &&
+          currentTrickSize < expectedTrickSize &&
+          (currentTrickNumber == null || currentTrickNumber == localTrickNumber - 1)) {
+        print('⚠️ Trick local incomplet: $currentTrickSize/$expectedTrickSize - Attente des cartes manquantes...');
+        // Attendre un peu pour que les cartes arrivent via WebSocket
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (!mounted) return;
+          final updatedTrickSize = cardManager.currentTrick.length;
+          print('📊 Après attente: $updatedTrickSize/$expectedTrickSize cartes dans le trick');
+          // Continuer avec le traitement même si le trick est encore incomplet
+          // (les compteurs doivent être mis à jour de toute façon)
+        });
+        // Ne pas return ici - on continue pour mettre à jour les compteurs
+      }
+
+      bool needsUpdate = false;
+
+      // ✅ MISE À JOUR UNIQUEMENT DU COMPTEUR DU GAGNANT
+      // IMPORTANT: Tous les joueurs reçoivent cet événement et mettent à jour le compteur du gagnant
+      // Cela garantit que tous les joueurs voient la mise à jour du compteur
+      if (winnerName.isNotEmpty) {
+        final currentCount = cardManager.getObtainedTricks(winnerName);
+        final newCount = currentCount + 1;
+        
+        // ✅ DEBUG: Vérifier avant la mise à jour
+        print('📊 Avant mise à jour compteur: $winnerName a $currentCount plis');
+        
+        cardManager.setObtainedTricks(winnerName, newCount);
+        
+        // ✅ DEBUG: Vérifier après la mise à jour
+        final verifiedCount = cardManager.getObtainedTricks(winnerName);
+        if (verifiedCount != newCount) {
+          print('❌ ERREUR: Compteur non mis à jour correctement ! Attendu: $newCount, Obtenu: $verifiedCount');
+        } else {
+          print('✅ Vérification: Compteur bien mis à jour - $winnerName a maintenant $verifiedCount plis');
+        }
+        
+        needsUpdate = true;
+        print('📊 Mise à jour compteur du gagnant (trick_completed): $winnerName → $newCount plis (était: $currentCount)');
+        print('   ✅ Tous les joueurs voient cette mise à jour via l\'événement WebSocket trick_completed');
+      }
+      
+      // ⚠️ NOTE: On n'utilise PAS obtainedTricks du backend pour mettre à jour tous les compteurs
+      // car cela peut causer des désynchronisations. On fait confiance au backend pour déterminer
+      // le gagnant, mais on gère les compteurs localement en incrémentant uniquement le gagnant.
+      // Tous les clients reçoivent l'événement trick_completed et mettent à jour le compteur du gagnant.
+
+      bool turnChanged = false;
+      if (cardManager.currentPlayerTurn != winnerName) {
+        print('🔄 Synchronisation du tour (trick_completed): $winnerName doit jouer');
+        cardManager.currentPlayerTurn = winnerName;
+        turnChanged = true;
+      }
+
+      // ✅ OPTIMISATION: Vérifier si c'est le dernier trick (fin de manche)
+      // Une manche = exactement 13 tricks (4 joueurs × 13 cartes = 52 cartes)
+      // Si nextTrickNumber est null ou > 13, c'est la fin de la manche
+      // Si currentTrickNumber = 13, c'est aussi la fin (le 13ème trick vient de se terminer)
+      final isRoundComplete = (nextTrickNumber != null && nextTrickNumber > 13) ||
+          (nextTrickNumber == null && currentTrickNumber != null && currentTrickNumber >= 13) ||
+          (currentTrickNumber != null && currentTrickNumber > 13);
+      
+      if (isRoundComplete) {
+        print('🎉 Dernier trick terminé ! Manche terminée (currentTrick=$currentTrickNumber, nextTrick=$nextTrickNumber).');
+        // Appeler onRoundCompleted() directement
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (mounted && !cardManager.isAnnouncementPhase) {
+            onRoundCompleted();
+          }
+        });
+        // Ne pas appeler _handleTrickEnd si la manche est terminée
+        return;
+      }
+
+      // Mettre à jour le numéro de trick pour le prochain trick
+      if (nextTrickNumber != null) {
+        cardManager.setCurrentTrickNumber(nextTrickNumber);
+      } else if (currentTrickNumber != null && currentTrickNumber < 13) {
+        cardManager.setCurrentTrickNumber(currentTrickNumber + 1);
+      }
+      
+      // ✅ Mettre à jour les cartes jouables après un trick complété
+      if (cardManager.currentPlayerTurn == widget.currentPlayerName) {
+        _updatePlayableCardsFromBackend();
+      }
+      
+      // ✅ Appeler la méthode dédiée pour gérer la fin du pli
+      _handleTrickEnd(winnerName, currentTrickNumber);
+
+      // ✅ TOUJOURS mettre à jour l'UI pour que tous les joueurs voient la mise à jour du compteur
+      // IMPORTANT: On force TOUJOURS un setState() pour garantir que l'UI affiche le nouveau compteur
+      if (mounted) {
+        setState(() {
+          // ✅ Force la mise à jour de l'UI pour afficher le nouveau compteur du gagnant
+          // Tous les joueurs verront cette mise à jour car ils reçoivent tous l'événement trick_completed
+          // Le setState() déclenchera un rebuild de tous les widgets, y compris ceux qui affichent les compteurs
+        });
+        print('✅ setState() appelé pour synchroniser les compteurs et le tour - TOUS LES JOUEURS voient la mise à jour');
+        
+        // ✅ DEBUG: Vérifier que le compteur est bien affiché après setState
+        if (winnerName.isNotEmpty) {
+          final displayedCount = cardManager.getObtainedTricks(winnerName);
+          final displayText = getPlayerAnnouncementDisplay(winnerName);
+          print('🔍 Après setState: Compteur affiché pour $winnerName = $displayedCount plis (affichage: $displayText)');
+        }
+      }
+    });
+
+    // ✅ Écouter l'événement round_completed_broadcast pour synchroniser le tableau de scores
+    // Note: Les scores sont maintenant calculés par le backend et reçus via round_scores_updated
+    _roundCompletedSubscription = wsService.onRoundCompleted().listen((data) {
+      if (!mounted) return;
+      
+      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+      final roundNumber = data['roundNumber'] as int? ?? data['round_number'] as int?;
+      final scores = data['scores'] as Map<String, dynamic>?;
+      final announcedByPlayer = data['announcedByPlayer'] as Map<String, dynamic>?;
+      final obtainedByPlayer = data['obtainedByPlayer'] as Map<String, dynamic>?;
+      
+      // ✅ NOUVEAU: Récupérer les scores globaux depuis le backend
+      Map<String, dynamic>? globalScores;
+      final globalScoresRaw = data['global_scores'] ?? data['globalScores'];
+      if (globalScoresRaw is Map) {
+        globalScores = globalScoresRaw as Map<String, dynamic>?;
+      } else if (globalScoresRaw is List) {
+        globalScores = {};
+        print('⚠️ GlobalScores reçus comme List dans round_completed, conversion en Map');
+      }
+      
+      if (roomId == gameSession.roomId && roundNumber != null) {
+        print('📊 Round $roundNumber terminé - Synchronisation du tableau de scores');
+        
+        // ✅ Convertir les données reçues
+        final players = gameSession.players
+            .map((p) => p['name'] as String? ?? 'Joueur')
+            .toList();
+        
+        final announcedMap = <String, int>{};
+        final obtainedMap = <String, int>{};
+        final scoresMap = <String, int>{};
+        
+        for (final player in players) {
+          if (announcedByPlayer != null) {
+            announcedMap[player] = (announcedByPlayer[player] as num?)?.toInt() ?? 0;
+          }
+          if (obtainedByPlayer != null) {
+            obtainedMap[player] = (obtainedByPlayer[player] as num?)?.toInt() ?? 0;
+          }
+          // ✅ Utiliser les scores du backend s'ils sont disponibles
+          if (scores != null) {
+            scoresMap[player] = (scores[player] as num?)?.toInt() ?? 0;
+          }
+        }
+        
+        // ✅ Synchroniser les compteurs de plis obtenus si fournis
+        if (obtainedByPlayer != null) {
+          for (final entry in obtainedByPlayer.entries) {
+            final playerName = entry.key as String;
+            final count = (entry.value as num?)?.toInt() ?? 0;
+            cardManager.setObtainedTricks(playerName, count);
+          }
+        }
+        
+        // ✅ CRITIQUE: Mettre à jour les scores globaux (compteurs de cristal) depuis le backend
+        // Cela garantit que tous les joueurs voient les mêmes scores en temps réel
+        if (globalScores != null && globalScores.isNotEmpty) {
+          print('💎 Synchronisation des scores globaux depuis round_completed_broadcast');
+          for (int i = 0; i < players.length; i++) {
+            final playerName = players[i];
+            final globalScore = globalScores[playerName] as num?;
+            
+            if (globalScore != null && i < gameSession.globalScores.length) {
+              final oldScore = gameSession.globalScores[i];
+              gameSession.globalScores[i] = globalScore.toDouble();
+              print('💎 Score global mis à jour pour $playerName: ${oldScore.toInt()} → ${globalScore.toInt()}');
+            }
+          }
+        } else {
+          // ✅ Fallback: Si le backend n'envoie pas global_scores, recalculer localement
+          print('⚠️ GlobalScores non fourni par le backend, recalcul local');
+          if (obtainedMap.isNotEmpty && announcedMap.isNotEmpty && roundNumber > 0) {
+            final roundIndex = roundNumber - 1;
+            if (roundIndex >= 0 && roundIndex < gameSession.roundsData.length) {
+              final obtainedList = players
+                  .map((p) => obtainedMap[p] ?? 0)
+                  .toList();
+              
+              // S'assurer que le round a les bonnes annonces
+              final round = gameSession.roundsData[roundIndex];
+              if (round['announcements'] == null || (round['announcements'] as List).isEmpty) {
+                final announcementsList = players
+                    .map((p) => announcedMap[p] ?? 0)
+                    .toList();
+                round['announcements'] = announcementsList;
+              }
+              
+              // Recalculer les scores globaux
+              gameSession.finalizeRound(roundIndex, obtainedList);
+              print('💎 Scores globaux recalculés localement pour Round $roundNumber');
+            }
+          }
+        }
+        
+        // ✅ Mettre à jour l'UI pour refléter les nouveaux scores globaux
+        if (mounted) {
+          setState(() {
+            // Les scores globaux sont maintenant à jour dans gameSession.globalScores
+            // Le compteur de cristal se mettra à jour automatiquement via getPlayerGlobalScore
+          });
+        }
+        
+        // ✅ Afficher le tableau de scores immédiatement (il se fermera automatiquement après 5 secondes)
+        if (mounted && scoresMap.isNotEmpty) {
+          showScoreboardDialog(
+            players,
+            announcedMap.isNotEmpty ? announcedMap : {},
+            obtainedMap.isNotEmpty ? obtainedMap : {},
+            scoresMap,
+            autoClose: true, // ✅ Fermeture automatique à la fin d'une manche
+          );
+          
+          // ✅ Après la fermeture du tableau, démarrer une nouvelle manche si la partie n'est pas terminée
+          Future.delayed(const Duration(seconds: 6), () async {
+            if (!mounted) return;
+            
+            // Vérifier si la partie est terminée
+            final winnerIndex = gameSession.globalScores.indexWhere((s) => s >= 150);
+            final completedRounds = gameSession.roundsData
+                .where((r) => (r['isCompleted'] as bool?) == true)
+                .length;
+            final isGameOver = winnerIndex != -1 || completedRounds >= 10;
+            
+            if (!isGameOver) {
+              print('🔄 Démarrage automatique d\'une nouvelle manche après affichage du tableau de scores');
+              await startNewRound();
+            } else {
+              print('🎯 Partie terminée, pas de nouvelle manche');
+            }
+          });
+        }
+      }
+    });
+
+    // ✅ Écouter l'événement round_scores_updated pour mettre à jour les scores en temps réel
+    _roundScoresUpdatedSubscription = wsService.onRoundScoresUpdated().listen((data) {
+      if (!mounted) return;
+      
+      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+      final roundId = data['round_id'] as int?;
+      final roundNumber = data['round_number'] as int?;
+      
+      // ✅ Gérer le cas où scores peut être une List ou une Map
+      final scoresRaw = data['scores'];
+      Map<String, dynamic>? scores;
+      if (scoresRaw is Map) {
+        scores = scoresRaw as Map<String, dynamic>?;
+      } else if (scoresRaw is List) {
+        // Si c'est une liste, la convertir en Map (cas rare mais possible)
+        scores = {};
+        print('⚠️ Scores reçus comme List, conversion en Map');
+      }
+      
+      // ✅ Gérer le cas où announcements, obtainedTricks ou globalScores peuvent être des List
+      Map<String, dynamic>? announcements;
+      final announcementsRaw = data['announcements'];
+      if (announcementsRaw is Map) {
+        announcements = announcementsRaw as Map<String, dynamic>?;
+      } else if (announcementsRaw is List) {
+        announcements = {};
+        print('⚠️ Announcements reçus comme List, conversion en Map');
+      }
+      
+      Map<String, dynamic>? obtainedTricks;
+      final obtainedTricksRaw = data['obtained_tricks'];
+      if (obtainedTricksRaw is Map) {
+        obtainedTricks = obtainedTricksRaw as Map<String, dynamic>?;
+      } else if (obtainedTricksRaw is List) {
+        obtainedTricks = {};
+        print('⚠️ ObtainedTricks reçus comme List, conversion en Map');
+      }
+      
+      Map<String, dynamic>? globalScores;
+      final globalScoresRaw = data['global_scores'];
+      if (globalScoresRaw is Map) {
+        globalScores = globalScoresRaw as Map<String, dynamic>?;
+      } else if (globalScoresRaw is List) {
+        globalScores = {};
+        print('⚠️ GlobalScores reçus comme List, conversion en Map');
+      }
+      
+      if (roomId == gameSession.roomId && scores != null && scores.isNotEmpty) {
+        print('📊 Scores mis à jour (round_scores_updated): Round $roundNumber');
+        
+        // Convertir les scores en Map<String, int>
+        final scoresMap = <String, int>{};
+        for (final entry in scores.entries) {
+          scoresMap[entry.key as String] = (entry.value as num?)?.toInt() ?? 0;
+        }
+        
+        // Convertir les annonces et plis obtenus
+        final announcedMap = <String, int>{};
+        final obtainedMap = <String, int>{};
+        
+        if (announcements != null) {
+          for (final entry in announcements.entries) {
+            announcedMap[entry.key as String] = (entry.value as num?)?.toInt() ?? 0;
+          }
+        }
+        
+        // ⚠️ NOTE: On ne synchronise PAS les compteurs depuis round_scores_updated
+        // Les compteurs sont mis à jour uniquement lors de trick_completed pour le gagnant
+        // Cela évite les désynchronisations et les écrasements de valeurs locales
+        if (obtainedTricks != null) {
+          for (final entry in obtainedTricks.entries) {
+            final playerName = entry.key as String;
+            final serverCount = (entry.value as num?)?.toInt() ?? 0;
+            obtainedMap[playerName] = serverCount;
+            // ⚠️ On ne met PAS à jour les compteurs locaux ici
+            // Ils sont mis à jour uniquement lors de trick_completed pour le gagnant
+          }
+        }
+        
+        // ✅ CRITIQUE: Mettre à jour les scores globaux (compteur de cristal) depuis le backend
+        // Les scores globaux doivent être synchronisés en temps réel pour tous les joueurs
+        if (globalScores != null && globalScores.isNotEmpty) {
+          // ✅ Si le backend envoie global_scores, les utiliser directement (source de vérité)
+          print('💎 Synchronisation des scores globaux depuis round_scores_updated');
+          final players = gameSession.players
+              .map((p) => p['name'] as String? ?? 'Joueur')
+              .toList();
+          
+          for (int i = 0; i < players.length; i++) {
+            final playerName = players[i];
+            final globalScore = globalScores[playerName] as num?;
+            
+            if (globalScore != null && i < gameSession.globalScores.length) {
+              final oldScore = gameSession.globalScores[i];
+              gameSession.globalScores[i] = globalScore.toDouble();
+              if (oldScore != globalScore.toDouble()) {
+                print('💎 Score global mis à jour pour $playerName: ${oldScore.toInt()} → ${globalScore.toInt()}');
+              }
+            }
+          }
+        } else if (obtainedMap.isNotEmpty && announcedMap.isNotEmpty && roundNumber != null) {
+          // ✅ Fallback: Si le backend n'envoie pas global_scores, recalculer localement
+          // Note: round_scores_updated est envoyé après chaque trick, mais on ne met à jour
+          // les scores globaux qu'à la fin du round (trick 13) pour éviter les calculs répétés
+          final players = gameSession.players
+              .map((p) => p['name'] as String? ?? 'Joueur')
+              .toList();
+          
+          // Vérifier si c'est la fin du round (trick 13)
+          // On peut le détecter en vérifiant si tous les joueurs ont obtenu 13 plis au total
+          final totalObtained = obtainedMap.values.fold<int>(0, (sum, val) => sum + (val ?? 0));
+          final isRoundComplete = totalObtained >= 13 * players.length;
+          
+          if (isRoundComplete) {
+            // Fallback: Si le backend n'envoie pas global_scores et que le round est complet,
+            // utiliser finalizeRound pour calculer et mettre à jour les scores globaux
+            final obtainedList = players
+                .map((p) => obtainedMap[p] ?? 0)
+                .toList();
+            
+            // S'assurer que le round existe dans roundsData
+            final roundIndex = roundNumber - 1;
+            if (roundIndex >= 0 && roundIndex < gameSession.roundsData.length) {
+              // Mettre à jour les annonces du round si nécessaire
+              final round = gameSession.roundsData[roundIndex];
+              if (round['announcements'] == null || (round['announcements'] as List).isEmpty) {
+                final announcementsList = players
+                    .map((p) => announcedMap[p] ?? 0)
+                    .toList();
+                round['announcements'] = announcementsList;
+              }
+              
+              // Appeler finalizeRound pour mettre à jour globalScores
+              gameSession.finalizeRound(roundIndex, obtainedList);
+              print('💎 Scores globaux recalculés via finalizeRound pour Round $roundNumber');
+            }
+          }
+        }
+        
+        // Mettre à jour l'affichage si nécessaire
+        if (mounted) {
+          setState(() {
+            // Le compteur de cristal se mettra à jour automatiquement via getPlayerGlobalScore
+          });
+        }
+      }
+    });
+
+    // ✅ NOUVEAU: Écouter l'événement turn_changed pour synchroniser le tour depuis le backend
+    // Cela garantit que tous les clients sont synchronisés même si la réponse HTTP est perdue
+    _turnChangedSubscription = wsService.onTurnChanged().listen((data) {
+      if (!mounted) return;
+      
+      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+      final currentPlayerName = data['current_player_name'] as String? ?? data['currentPlayerName'] as String?;
+      
+      if (roomId != gameSession.roomId || currentPlayerName == null || currentPlayerName.isEmpty) {
+        return;
+      }
+      
+      // ✅ Synchroniser le tour depuis le backend
+      if (cardManager.currentPlayerTurn != currentPlayerName) {
+        print('🔄 Tour synchronisé via WebSocket (turn_changed): $currentPlayerName');
+        cardManager.currentPlayerTurn = currentPlayerName;
+        
+        if (mounted) {
+          // ✅ Mettre à jour les cartes jouables quand c'est le tour du joueur local
+          if (currentPlayerName == widget.currentPlayerName) {
+            _updatePlayableCardsFromBackend();
+          }
+          setState(() {});
+          
+          // ✅ Démarrer le timer de timeout de 15 secondes pour le joueur actuel
+          startPlayerTurnTimeout();
+          
+          // ✅ Si c'est le tour d'un bot, déclencher le jeu automatique
+          // Mais seulement si aucun joueur n'est déjà en train de jouer
+          print('🔍 turn_changed: Vérification si $currentPlayerName est un bot...');
+          if (currentPlayerPlaying == null) {
+            print('   ✅ Aucun joueur en train de jouer, déclenchement maybeAutoPlayCurrentBot() dans 300ms');
+            Future.delayed(const Duration(milliseconds: 300), () {
+              if (mounted && currentPlayerPlaying == null) {
+                print('   ✅ Appel de maybeAutoPlayCurrentBot() après délai');
+                maybeAutoPlayCurrentBot();
+              } else {
+                print('   ⚠️ maybeAutoPlayCurrentBot() annulé: mounted=$mounted, currentPlayerPlaying=$currentPlayerPlaying');
+              }
+            });
+          } else {
+            print('   ⚠️ maybeAutoPlayCurrentBot() ignoré: $currentPlayerPlaying est déjà en train de jouer');
+          }
+        }
+      }
+    });
+
+    cardPlayedSubscription = wsService.onCardPlayed().listen((data) {
+      if (mounted) {
+        final playerName = data['playerName'] as String? ?? data['player_name'] as String?;
+        final cardData = data['card'] as Map<String, dynamic>?;
+        final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+
+        if (playerName != null && 
+            cardData != null && 
+            roomId == gameSession.roomId) {
+          
+          // ✅ Mettre à jour les cartes jouables si c'est le tour du joueur local après qu'une carte soit jouée
+          if (cardManager.currentPlayerTurn == widget.currentPlayerName) {
+            _updatePlayableCardsFromBackend();
+          }
+          
+          // ✅ CORRECTION: Ignorer l'événement pour le joueur local (évite double animation)
+          if (playerName == widget.currentPlayerName) {
+            // Vérifier si c'est un événement local qu'on a déjà traité
+            final cardSuitShort = (cardData['suit'] as String? ?? '').toUpperCase();
+            final cardValueShort = (cardData['value'] as String? ?? '').toUpperCase();
+            final normalizedValue = cardValueShort == '10' ? '0' : cardValueShort;
+            final cardCode = '$normalizedValue$cardSuitShort';
+            final trickNumber =
+                (data['trickNumber'] as int?) ?? (data['trick_number'] as int?) ?? cardManager.currentTrickNumber;
+            final eventKey = buildCardEventKey(playerName, cardCode, trickNumber);
+            
+            if (consumeLocalCardEvent(eventKey)) {
+              print('ℹ️ Événement WebSocket ignoré pour joueur local $playerName (carte $cardCode déjà jouée localement)');
+              return;
+            }
+            // Si l'événement local n'a pas été consommé, ignorer quand même pour éviter double animation
+            print('ℹ️ Événement WebSocket ignoré pour joueur local $playerName (évite double animation)');
+            return;
+          }
+          
+          // ✅ NOUVEAU: Construire cardCode immédiatement
+          final cardSuitShort = (cardData['suit'] as String? ?? '').toUpperCase();
+          final cardValueShort = (cardData['value'] as String? ?? '').toUpperCase();
+          final normalizedValue = cardValueShort == '10' ? '0' : cardValueShort;
+          final cardCode = '$normalizedValue$cardSuitShort';
+          final trickNumber =
+              (data['trickNumber'] as int?) ?? (data['trick_number'] as int?) ?? cardManager.currentTrickNumber;
+          final eventKey = buildCardEventKey(playerName, cardCode, trickNumber);
+          
+          // ✅ Vérifier d'abord si c'est un événement local qu'on a déjà traité
+          if (consumeLocalCardEvent(eventKey)) {
+            print('ℹ️ Carte $cardCode de $playerName déjà appliquée localement (echo WebSocket ignoré)');
+            return;
+          }
+          
+          // ✅ IMPORTANT: Vérifier si c'est un bot AVANT de vérifier le tour
+          // Car les bots jouent automatiquement et on ne doit pas les attendre
+          final isBotPlayer = gameSession.players.any((p) {
+            final name = p['name'] as String?;
+            if (name != playerName) return false;
+            
+            final isBotValue = p['isBot'];
+            if (isBotValue == true || isBotValue == 1 || (isBotValue is String && isBotValue == '1')) {
+              return true;
+            }
+            
+            final is_botValue = p['is_bot'];
+            if (is_botValue == true || is_botValue == 1 || (is_botValue is String && is_botValue == '1')) {
+              return true;
+            }
+            
+            final isReplacementBotValue = p['isReplacementBot'];
+            if (isReplacementBotValue == true || isReplacementBotValue == 1 || (isReplacementBotValue is String && isReplacementBotValue == '1')) {
+              return true;
+            }
+            
+            return false;
+          });
+          
+          // ✅ VÉRIFIER QUE LA CARTE N'A PAS DÉJÀ ÉTÉ JOUÉE (pour tous les joueurs, bots et humains)
+          final currentTrick = cardManager.currentTrick;
+          final cardAlreadyPlayed = currentTrick.any(
+            (entry) {
+              final entryCard = entry['card'] as Map<String, dynamic>?;
+              final entryPlayer = entry['player'] as String?;
+              return entryCard != null &&
+                  entryPlayer == playerName &&
+                  (entryCard['code'] as String?) == cardCode;
+            },
+          );
+          
+          if (cardAlreadyPlayed) {
+            // Pour les bots : la carte a été ajoutée localement, ignorer l'événement WebSocket
+            // Pour les humains : la carte a déjà été traitée, ignorer
+            if (isBotPlayer) {
+              print('ℹ️ Carte $cardCode de bot $playerName déjà dans le trick (ajoutée localement) - événement WebSocket ignoré pour éviter doublon');
+            } else {
+              print('⚠️ Carte $cardCode déjà jouée par $playerName dans le trick actuel - IGNORÉE');
+            }
+            return;
+          }
+          
+          // ✅ CORRECTION: Pour les bots, on NE DOIT PAS ignorer l'événement WebSocket si la carte n'est pas encore dans le trick
+          // Car les autres clients (Alpha, Elias) doivent voir les cartes des bots
+          if (isBotPlayer) {
+            print('📨 Carte de bot $playerName reçue via WebSocket: $cardCode (synchronisation pour autres clients)');
+          } else {
+            print('📨 Carte reçue via WebSocket: $cardCode pour $playerName');
+          }
+          
+          // ✅ POUR LES JOUEURS HUMAINS: Vérifier maintenant le tour
+          // ⚠️ Mais ne pas sortir immédiatement si ce n'est pas le tour
+          // Car le tour peut avoir changé entre l'émission et la réception
+          // Juste logger et continuer
+          if (!isBotPlayer && cardManager.currentPlayerTurn != playerName) {
+            print('⚠️ Tour désynchronisé: reçu carte de $playerName mais le tour est ${cardManager.currentPlayerTurn}');
+            print('   Cela peut se produire si le tour a changé après l\'envoi de la carte');
+            print('   On continue quand même - ajouter la carte et synchroniser le tour');
+          }
+          
+          // ✅ VALIDER QUE LE JOUEUR A LA CARTE (pour les humains uniquement)
+          // Pour les bots, on fait confiance au backend
+          Map<String, dynamic>? validCard;
+          if (!isBotPlayer) {
+            final playerCards = cardManager.getPlayerCards(playerName);
+            print('   Cartes de $playerName: ${playerCards.map((c) => c['code']).join(", ")}');
+            
+            try {
+              validCard = playerCards.firstWhere(
+                (c) => (c['code'] as String?) == cardCode,
+              );
+            } catch (_) {
+              print('❌ ERREUR: Carte $cardCode introuvable pour $playerName - événement IGNORÉ');
+              return;
+            }
+          } else {
+            // Pour les bots, construire la carte depuis les données WebSocket
+            final cardSuitShort = (cardData['suit'] as String? ?? '').toUpperCase();
+            final cardValueShort = (cardData['value'] as String? ?? '').toUpperCase();
+            final suitMapping = {
+              'S': 'SPADES',
+              'C': 'CLUBS',
+              'H': 'HEARTS',
+              'D': 'DIAMONDS',
+            };
+            final valueMapping = {
+              'A': 'ACE',
+              'K': 'KING',
+              'Q': 'QUEEN',
+              'J': 'JACK',
+              '0': '10',
+            };
+            final suitName = suitMapping[cardSuitShort] ?? cardSuitShort;
+            final valueName = valueMapping[cardValueShort] ?? cardValueShort;
+            
+            // Construire la carte complète
+            validCard = {
+              'code': cardCode,
+              'suit': suitName,
+              'value': valueName,
+              'image': 'assets/images/cards/${suitName.toLowerCase()}_$valueName.png',
+            };
+            print('   Carte de bot construite depuis WebSocket: $cardCode');
+          }
+
+          if (!markCardEventProcessedIfNew(eventKey)) {
+            print('⚠️ Événement carte $cardCode de $playerName déjà traité - IGNORÉ');
+            return;
+          }
+
+          // ✅ AJOUTER LA CARTE AU TRICK (pour tous les joueurs : humains et bots)
+          // Cela garantit que tous les clients voient les cartes, même celles des bots
+          if (validCard == null) {
+            print('❌ ERREUR: validCard est null pour $playerName - impossible d\'ajouter au trick');
+            return;
+          }
+          print('✅ Ajout de la carte $cardCode au trick pour $playerName (${isBotPlayer ? "bot" : "humain"})');
+          // ✅ CORRECTION: Utiliser addCardToTrick() au lieu de playCard()
+          // car le tour a peut-être déjà changé via WebSocket
+          cardManager.addCardToTrick(playerName, validCard);
+          cardManager.currentPlayerTurn = playerName; // ✅ Synchroniser le tour
+          
+          // ✅ DEBUG: Vérifier que la carte a bien été ajoutée au trick
+          final verifyTrick = cardManager.currentTrick;
+          final cardFound = verifyTrick.any((entry) {
+            final card = entry['card'] as Map<String, dynamic>?;
+            final entryPlayer = entry['player'] as String?;
+            return entryPlayer == playerName && (card?['code'] as String?) == cardCode;
+          });
+          
+          if (!cardFound) {
+            print('❌ ERREUR: Carte $cardCode de $playerName n\'a PAS été ajoutée au trick !');
+            print('   Trick actuel: ${verifyTrick.map((e) => '${e['player']}→${e['card']?['code']}').join(", ")}');
+          } else {
+            print('✅ Vérification: Carte $cardCode de $playerName bien présente dans le trick');
+          }
+          
+          if (mounted) {
+            setState(() {});
+            print('✅ setState() appelé après ajout de carte au trick');
+          }
+          
+          // ✅ Vérifier si le pli est complet (4 cartes)
+          final updatedTrick = cardManager.currentTrick;
+          if (updatedTrick.length >= 4) {
+            print('🕒 Pli complété (4 cartes) - attente de trick_completed du backend');
+          } else {
+            print('   Pli incomplet: ${updatedTrick.length}/4 cartes');
+          }
+          
+          // ✅ Ne plus faire d'animation pour les joueurs distants - la carte est déjà ajoutée
+          // L'animation sera gérée par le backend via WebSocket si nécessaire
+          
+          // ✅ Vérifier si le prochain joueur est un bot et déclencher le jeu automatique
+          final nextPlayer = cardManager.currentPlayerTurn;
+          if (nextPlayer.isNotEmpty && nextPlayer != playerName) {
+            // ✅ Accepter à la fois true (booléen) et 1 (entier) comme valeur "bot"
+            final isNextPlayerBot = gameSession.players.any(
+              (p) {
+                final name = (p['name'] as String?);
+                if (name != nextPlayer) return false;
+                final isReplacementBotValue = p['isReplacementBot'];
+                final isBotValue = p['is_bot'] ?? p['isBot'];
+                final isReplacement = isReplacementBotValue == true || isReplacementBotValue == 1 || (isReplacementBotValue is String && isReplacementBotValue == '1');
+                final isBot = isBotValue == true || isBotValue == 1 || (isBotValue is String && isBotValue == '1');
+                return isReplacement || isBot;
+              },
+            );
+            
+            if (isNextPlayerBot) {
+              print('🔄 Appel maybeAutoPlayCurrentBot après carte distante (bot suivant: $nextPlayer)');
+              Future.delayed(const Duration(milliseconds: 300), () {
+                if (mounted && currentPlayerPlaying == null) {
+                  maybeAutoPlayCurrentBot();
+                }
+              });
+            } else {
+              print('👤 Pas d\'appel automatique: $nextPlayer est un joueur humain');
+            }
+          }
+        }
+      }
+    });
+  }
+
+  void _startRoomPolling() {
+    if (gameSession.playWithBots) return;
+    roomPollTimer?.cancel();
+    roomPollTimer = Timer.periodic(const Duration(seconds: 3), (t) async {
+      try {
+        final roomId = gameSession.roomId ?? '';
+        if (roomId.isEmpty) return;
+        final res = await GameApiService.instance.getRoom(roomId: roomId);
+        final data = (res['data'] as Map?) ?? res;
+        final players = (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+        if (players.isEmpty) return;
+        _applyBackendPlayersState(players, startGameIfReady: true);
+      } catch (e) {
+        print('⚠️ Erreur lors du polling des joueurs: $e');
+      }
+    });
+  }
+
+  /// ✅ Synchronisation périodique des compteurs via API
+  /// En cas de désynchronisation WebSocket, cette méthode resynchronise les compteurs toutes les 5 secondes
+  /// Les compteurs sont TOUJOURS mis à jour automatiquement depuis le backend (source de vérité)
+  void _startCountersSyncPolling() {
+    if (gameSession.playWithBots) return;
+    
+    // ✅ Annuler le timer existant s'il y en a un
+    _countersSyncTimer?.cancel();
+    
+    // ✅ Timer pour synchroniser les compteurs toutes les 5 secondes pendant la phase de jeu
+    _countersSyncTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
+      // ✅ Ne synchroniser que pendant la phase de jeu (pas pendant les annonces)
+      if (!mounted || cardManager.isAnnouncementPhase) return;
+      
+      try {
+        final roomId = gameSession.roomId ?? '';
+        if (roomId.isEmpty) return;
+        
+        // ✅ Récupérer les compteurs depuis le backend (source de vérité)
+        final response = await GameApiService.instance.getCurrentTrickCounters(
+          roomId: roomId,
+        ).timeout(const Duration(seconds: 2));
+        
+        if (response['success'] == true) {
+          final serverCounters = response['obtainedTricks'] as Map<String, dynamic>?;
+          
+          // ⚠️ NOTE: La synchronisation périodique des compteurs est DÉSACTIVÉE
+          // Les compteurs sont mis à jour uniquement lors de trick_completed pour le gagnant
+          // Cela évite les désynchronisations et les écrasements de valeurs locales
+          // La synchronisation périodique peut être réactivée si nécessaire pour la récupération après déconnexion
+          // mais pour l'instant, on fait confiance aux mises à jour incrémentales lors de chaque trick
+          
+          // ✅ Optionnel: Log pour debug (sans mise à jour)
+          if (serverCounters != null && serverCounters.isNotEmpty) {
+            print('📊 RESYNC: Compteurs serveur disponibles mais non synchronisés (gestion incrémentale locale)');
+            for (final entry in serverCounters.entries) {
+              final playerName = entry.key as String;
+              final serverCount = (entry.value as num?)?.toInt() ?? 0;
+              final localCount = cardManager.getObtainedTricks(playerName);
+              if (localCount != serverCount) {
+                print('   - $playerName: local=$localCount, serveur=$serverCount');
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // ⚠️ Ne pas logger les erreurs pour éviter le spam en cas de déconnexion
+        // La synchronisation se fera au prochain intervalle
+      }
+    });
+  }
+
+  void _startStateSyncPolling({bool forceRestart = false}) {
+    if (gameSession.playWithBots) return;
+    if (stateSyncTimer != null && !forceRestart) return;
+    stateSyncTimer?.cancel();
+    final interval = isWebSocketConnected ? GameRoomBaseState.pollIntervalWebSocket : GameRoomBaseState.pollIntervalFallback;
+    stateSyncTimer = Timer.periodic(interval, (_) => _pollGameState());
+  }
+
+  Future<void> _pollGameState() async {
+    if (!mounted || gameSession.playWithBots) return;
+    try {
+      final roomId = gameSession.roomId ?? '';
+      if (roomId.isEmpty) return;
+      
+      final res = await GameApiService.instance.getRoom(roomId: roomId);
+      final data = (res['data'] as Map?) ?? res;
+      final players = (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+      
+      if (players.isNotEmpty) {
+        _applyBackendPlayersState(players, startGameIfReady: false);
+      }
+      
+      consecutiveStatePollingErrors = 0;
+      lastSuccessfulStatePoll = DateTime.now();
+    } catch (e) {
+      consecutiveStatePollingErrors++;
+      if (consecutiveStatePollingErrors > 5) {
+        print('⚠️ Trop d\'erreurs de polling, arrêt temporaire');
+        stateSyncTimer?.cancel();
+      }
+    }
+  }
+
+  void _applyBackendPlayersState(List<Map<String, dynamic>> players, {bool startGameIfReady = false}) {
+    if (players.isEmpty) return;
+    
+    final currentName = widget.currentPlayerName;
+    
+    // ✅ Normaliser tous les joueurs avec leurs noms
+    final normalizedPlayers = players.map((p) {
+      final pseudo = (p['pseudo'] ?? '').toString();
+      final first = (p['first_name'] ?? '').toString();
+      final last = (p['last_name'] ?? '').toString();
+      final name = (pseudo.isNotEmpty
+              ? pseudo
+              : ([first, last]
+                    .where((s) => s.isNotEmpty)
+                    .join(' ')
+                    .trim()))
+          .trim();
+      return {
+        ...p,
+        'normalizedName': name.isNotEmpty ? name : 'Joueur',
+      };
+    }).toList();
+    
+    // ✅ Trier tous les joueurs par position backend pour avoir l'ordre de rotation
+    normalizedPlayers.sort((a, b) =>
+        ((a['position'] ?? 0) as int)
+            .compareTo((b['position'] ?? 0) as int));
+    
+    // ✅ Trouver l'index du joueur actuel dans la liste triée
+    final currentPlayerIndex = normalizedPlayers.indexWhere(
+      (p) => (p['normalizedName'] as String?) == currentName && currentName.isNotEmpty,
+    );
+    
+    if (currentPlayerIndex == -1) {
+      print('⚠️ Joueur actuel non trouvé dans la liste des joueurs');
+      return;
+    }
+    
+    // ✅ Créer une rotation cyclique : le joueur actuel en premier (bottom), puis les suivants
+    final rotatedPlayers = <Map<String, dynamic>>[];
+    for (int i = 0; i < normalizedPlayers.length; i++) {
+      final index = (currentPlayerIndex + i) % normalizedPlayers.length;
+      rotatedPlayers.add(normalizedPlayers[index]);
+    }
+    
+    // ✅ Positions d'affichage dans l'ordre : bottom, right, top, left
+    final displayPositions = ['bottom', 'right', 'top', 'left'];
+    final normalized = <Map<String, dynamic>>[];
+    
+    for (int i = 0; i < rotatedPlayers.length && i < 4; i++) {
+      final p = rotatedPlayers[i];
+      final name = p['normalizedName'] as String;
+      final isCurrent = name == currentName && currentName.isNotEmpty;
+      
+      // ✅ Utiliser la valeur booléenne préservée dans normalizedPlayers
+      final isBot = (p['is_bot'] as bool?) ?? false;
+      
+      final backendAvatar = (p['avatar'] ?? '').toString();
+      final isCreator = ((p['is_creator'] ?? p['isCreator']) == true);
+      
+      final resolvedAvatar = isBot
+          ? '🤖'
+          : (backendAvatar.isNotEmpty ? backendAvatar : '👤');
+      
+      normalized.add({
+        'name': name,
+        'displayPosition': displayPositions[i],
+        'avatar': resolvedAvatar,
+        'isCurrentPlayer': isCurrent,
+        'isCreator': isCreator,
+        'score': '0/0',
+        'cards': 13,
+        'is_bot': isBot, // ✅ Valeur booléenne préservée
+        'backendPosition': (p['position'] ?? 0) as int,
+      });
+    }
+
+    if (mounted) {
+      setState(() {
+        gameSession.players = normalized;
+        if (gameSession.globalScores.length != normalized.length) {
+          gameSession.globalScores = List.filled(normalized.length, 0.0);
+        }
+      });
+    }
+
+    if (startGameIfReady && normalized.length >= requiredPlayers && !hasGameStarted) {
+      waitingForHumans = false;
+      startCardDistribution();
+    }
+  }
+
+  void _synchronizePlayerReplacement(String playerName, String botName, bool isPermanent) {
+    final players = gameSession.players;
+    final playerIndex = players.indexWhere(
+      (p) => (p['name'] as String?) == playerName,
+    );
+
+    if (playerIndex != -1) {
+      if (!isPermanent) {
+        temporaryReplacements[playerName] = {
+          'botName': botName,
+          'timestamp': DateTime.now(),
+          'isPermanent': false,
+        };
+      } else {
+        permanentlyExcludedPlayers.add(playerName);
+      }
+
+      _replacePlayerWithBotLocally(playerName, botName, isPermanent);
+    }
+  }
+
+  void _synchronizePlayerRestoration(String playerName, String botName) {
+    _restorePlayer(playerName);
+  }
+
+  void _replacePlayerWithBotLocally(String playerName, String botName, bool isPermanent) {
+    final players = gameSession.players;
+    final playerIndex = players.indexWhere(
+      (p) => (p['name'] as String?) == playerName,
+    );
+
+    if (playerIndex != -1) {
+      final player = players[playerIndex];
+      final playerCards = cardManager.getPlayerCards(playerName);
+
+      setState(() {
+        players[playerIndex] = {
+          ...player,
+          'name': botName,
+          'avatar': '🤖',
+          'is_bot': true,
+          'isReplacementBot': true,
+          'replacedPlayerName': playerName,
+        };
+      });
+
+      if (playerCards.isNotEmpty) {
+        cardManager.transferPlayerCards(playerName, botName);
+      }
+
+      final announcements = cardManager.getCurrentRoundAnnouncements();
+      final playerAnnouncement = announcements.firstWhere(
+        (ann) => (ann['player'] as String?) == playerName,
+        orElse: () => <String, Object>{},
+      );
+      if ((playerAnnouncement['announcement'] as int?) != null) {
+        playerAnnouncement['player'] = botName;
+      }
+
+      cardManager.transferObtainedTricks(playerName, botName);
+      cardManager.updatePlayerNameInCurrentTrick(playerName, botName);
+
+      if (cardManager.currentPlayerTurn == playerName) {
+        cardManager.currentPlayerTurn = botName;
+      }
+
+      if (cardManager.isAnnouncementPhase && cardManager.currentPlayerTurn == botName) {
+        Future.delayed(const Duration(milliseconds: 800), () {
+          if (mounted) {
+            final botAnnouncement = cardManager.getBotAnnouncement(botName);
+            cardManager.makeAnnouncement(botName, botAnnouncement);
+            super.handleAnnouncementTurnComplete();
+          }
+        });
+      }
+
+      setState(() {});
+    }
+  }
+
+  void _restorePlayer(String playerName) {
+    final players = gameSession.players;
+    final botIndex = players.indexWhere(
+      (p) => (p['isReplacementBot'] as bool?) == true &&
+             (p['replacedPlayerName'] as String?) == playerName,
+    );
+
+    if (botIndex != -1) {
+      final bot = players[botIndex];
+      final botName = bot['name'] as String;
+      final botCards = cardManager.getPlayerCards(botName);
+
+      setState(() {
+        players[botIndex] = {
+          ...bot,
+          'name': playerName,
+          'avatar': '👤',
+          'is_bot': false,
+          'isReplacementBot': false,
+          'replacedPlayerName': null,
+        };
+      });
+
+      if (botCards.isNotEmpty) {
+        cardManager.transferPlayerCards(botName, playerName);
+      }
+
+      final announcements = cardManager.getCurrentRoundAnnouncements();
+      final botAnnouncement = announcements.firstWhere(
+        (ann) => (ann['player'] as String?) == botName,
+        orElse: () => <String, Object>{},
+      );
+      if ((botAnnouncement['announcement'] as int?) != null) {
+        botAnnouncement['player'] = playerName;
+      }
+
+      cardManager.transferObtainedTricks(botName, playerName);
+      cardManager.updatePlayerNameInCurrentTrick(botName, playerName);
+
+      if (cardManager.currentPlayerTurn == botName) {
+        cardManager.currentPlayerTurn = playerName;
+      }
+
+      temporaryReplacements.remove(playerName);
+      setState(() {});
+    }
+  }
+
+  Future<void> _handlePlayerDisconnection(String playerName) async {
+    final hasGameStarted = gameSession.currentRound > 0 || 
+                          cardManager.isAnnouncementPhase ||
+                          cardManager.getPlayerCards(playerName).isNotEmpty;
+    
+    if (playerName != widget.currentPlayerName) {
+      if (!hasGameStarted) {
+        final botName = 'Bot_Remplaceur_${playerName}';
+        temporaryReplacements[playerName] = {
+          'botName': botName,
+          'timestamp': DateTime.now(),
+          'isPermanent': false,
+          'canReconnect': true,
+        };
+
+        final roomId = gameSession.roomId ?? '';
+        if (roomId.isNotEmpty) {
+          try {
+            await GameApiService.instance.notifyPlayerDisconnection(
+              roomId: roomId,
+              playerName: playerName,
+            );
+          } catch (e) {
+            print('⚠️ Erreur notification backend déconnexion: $e');
+          }
+        }
+
+        _replacePlayerWithBotLocally(playerName, botName, false);
+      } else {
+        final botName = 'Bot_Remplaceur_${playerName}';
+        temporaryReplacements[playerName] = {
+          'botName': botName,
+          'timestamp': DateTime.now(),
+          'isPermanent': false,
+        };
+
+        _replacePlayerWithBotLocally(playerName, botName, false);
+
+        reconnectionCheckTimer = Timer(const Duration(seconds: 15), () {
+          if (temporaryReplacements.containsKey(playerName)) {
+            final replacement = temporaryReplacements[playerName];
+            if ((replacement?['isPermanent'] as bool?) != true) {
+              temporaryReplacements[playerName]!['isPermanent'] = true;
+              permanentlyExcludedPlayers.add(playerName);
+              _replacePlayerWithBotLocally(playerName, botName, true);
+            }
+          }
+        });
+      }
+    }
+  }
+
+  void _handlePlayerReconnection(String playerName) {
+    reconnectionCheckTimer?.cancel();
+    _restorePlayer(playerName);
+    
+    final roomId = gameSession.roomId ?? '';
+    if (roomId.isNotEmpty) {
+      try {
+        GameApiService.instance.notifyPlayerReconnection(
+          roomId: roomId,
+          playerName: playerName,
+        );
+      } catch (e) {
+        print('⚠️ Erreur notification backend reconnexion: $e');
+      }
+    }
+  }
+
+  // ========== CHAT (MODE HUMAIN UNIQUEMENT) ==========
+  
+  final List<Map<String, String>> _quickChatOptions = [
+    {'label': 'Jouez vite les gars !', 'message': 'Jouez vite les gars !', 'code': 'play_fast'},
+    {'label': 'Je suis mort 😢', 'message': 'Je suis mort 😢', 'code': 'i_am_dead'},
+    {'label': 'Ok', 'message': 'Ok', 'code': 'ok'},
+    {'label': 'Bonne chance !', 'message': 'Bonne chance à tous !', 'code': 'good_luck'},
+  ];
+  
+  final List<String> _emojiOptions = ['😂', '😭', '👍', '👎', '✅', '💪', '👀', '🖕', '💋', '🥇'];
+
+  Widget _buildChatOverlay() {
+    return Positioned(
+      bottom: 16,
+      left: 16,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (isChatPanelVisible) _buildChatPanel(),
+          const SizedBox(height: 10),
+          FloatingActionButton.small(
+            heroTag: 'room_chat_toggle',
+            backgroundColor: Colors.black.withOpacity(0.75),
+            onPressed: () {
+              setState(() {
+                isChatPanelVisible = !isChatPanelVisible;
+              });
+              if (isChatPanelVisible) {
+                _scrollChatToBottom();
+              }
+            },
+            child: const Icon(Icons.forum, color: Colors.white),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChatPanel() {
+    return Container(
+      width: 330,
+      constraints: const BoxConstraints(maxHeight: 400),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.85),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'Chat du salon',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                  ),
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.close, color: Colors.white70),
+                onPressed: () {
+                  setState(() {
+                    isChatPanelVisible = false;
+                  });
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            height: 60,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.vertical,
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  ..._quickChatOptions.map(
+                    (opt) => ActionChip(
+                      label: Text(opt['label']!, style: const TextStyle(fontSize: 11)),
+                      onPressed: () => _handleQuickMessage(opt),
+                      backgroundColor: Colors.white12,
+                      labelStyle: const TextStyle(color: Colors.white),
+                    ),
+                  ),
+                  ..._emojiOptions.map(
+                    (emoji) => Container(
+                      margin: const EdgeInsets.only(right: 6),
+                      child: Material(
+                        color: _getEmojiBackgroundColor(emoji),
+                        borderRadius: BorderRadius.circular(20),
+                        child: InkWell(
+                          onTap: () => _handleEmojiTap(emoji),
+                          borderRadius: BorderRadius.circular(20),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                            child: Text(emoji, style: const TextStyle(fontSize: 20)),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: chatInputController,
+                  style: const TextStyle(color: Colors.white),
+                  minLines: 1,
+                  maxLines: 2,
+                  decoration: InputDecoration(
+                    hintText: 'Tapez un message...',
+                    hintStyle: TextStyle(color: Colors.white.withOpacity(0.6)),
+                    filled: true,
+                    fillColor: Colors.white12,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  ),
+                  onSubmitted: (_) => _handleSendChatInput(),
+                ),
+              ),
+              const SizedBox(width: 8),
+              isSendingChatMessage
+                  ? const SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    )
+                  : IconButton(
+                      icon: const Icon(Icons.send, color: Colors.white),
+                      onPressed: _handleSendChatInput,
+                    ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChatToast() {
+    if (chatToastMessage == null || chatToastAnimation == null) {
+      return const SizedBox.shrink();
+    }
+    final pseudo = (chatToastMessage!['pseudo'] ?? 'Joueur').toString();
+    final message = (chatToastMessage!['message'] ?? '').toString();
+
+    return AnimatedBuilder(
+      animation: chatToastAnimation!,
+      builder: (context, child) {
+        final screenWidth = MediaQuery.of(context).size.width;
+        final leftPosition = (chatToastAnimation!.value + 1.0) / 2.0;
+        final left = leftPosition * (screenWidth + 300) - 300;
+
+        return Positioned(
+          bottom: isChatPanelVisible ? 310 : 120,
+          left: left,
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 300),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.85),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.white24),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  pseudo,
+                  style: const TextStyle(
+                    color: Colors.greenAccent,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  message,
+                  style: const TextStyle(color: Colors.white, fontSize: 15, height: 1.3),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _handleSendChatInput() {
+    final text = chatInputController.text.trim();
+    if (text.isEmpty) return;
+    _sendChatMessage(message: text, type: 'text');
+  }
+
+  void _handleQuickMessage(Map<String, String> option) {
+    final message = option['message'] ?? '';
+    if (message.isEmpty) return;
+    _sendChatMessage(
+      message: message,
+      type: 'preset',
+      presetCode: option['code'],
+    );
+  }
+
+  void _handleEmojiTap(String emoji) {
+    _sendChatMessage(message: emoji, type: 'emoji', presetCode: 'emoji_$emoji');
+  }
+
+  Future<void> _sendChatMessage({
+    required String message,
+    String type = 'text',
+    String? presetCode,
+  }) async {
+    if (isSendingChatMessage) return;
+    final trimmed = message.trim();
+    if (trimmed.isEmpty) return;
+
+    setState(() {
+      isSendingChatMessage = true;
+    });
+
+    if (!mounted) return;
+    chatInputController.clear();
+    
+    if (isChatPanelVisible) {
+      setState(() {
+        isChatPanelVisible = false;
+      });
+    }
+
+    // ✅ LOG: Envoi du message
+    print('📤 ENVOI MESSAGE CHAT');
+    print('   Expéditeur: ${widget.currentPlayerName}');
+    print('   Message: $trimmed');
+    print('   Type: $type');
+    
+    // ✅ Envoyer le message via WebSocket - il sera ajouté quand il reviendra du serveur
+    final roomId = gameSession.roomId;
+    if (roomId != null && roomId.isNotEmpty) {
+      try {
+        final wsService = GameWebSocketService();
+        if (wsService.isConnected) {
+          print('   ✅ WebSocket connecté, envoi en cours...');
+          await wsService.sendChatMessage(
+            message: trimmed,
+            type: type,
+            presetCode: presetCode,
+          ).then((_) {
+            print('   ✅ Message envoyé via WebSocket avec succès');
+          }).catchError((e) {
+            print('⚠️ Erreur WebSocket chat: $e');
+          });
+        } else {
+          print('   ❌ WebSocket non connecté');
+        }
+      } catch (e) {
+        print('⚠️ Erreur envoi chat: $e');
+      }
+    } else {
+      print('   ❌ RoomId invalide: $roomId');
+    }
+
+    // ✅ Attendre un peu avant de fetch pour laisser le serveur traiter le message
+    Future.delayed(const Duration(milliseconds: 500), () {
+      if (mounted) {
+        print('   📥 Fetch des messages depuis l\'API...');
+        _fetchChatMessagesFromApi();
+      }
+    });
+
+    if (mounted) {
+      setState(() {
+        isSendingChatMessage = false;
+      });
+    } else {
+      isSendingChatMessage = false;
+    }
+  }
+
+  Color _getEmojiBackgroundColor(String emoji) {
+    switch (emoji) {
+      case '😂':
+        return Colors.amber.withOpacity(0.3);
+      case '😭':
+        return Colors.blue.withOpacity(0.3);
+      case '👍':
+        return Colors.green.withOpacity(0.3);
+      case '👎':
+        return Colors.red.withOpacity(0.3);
+      case '✅':
+        return Colors.greenAccent.withOpacity(0.3);
+      case '💪':
+        return Colors.orange.withOpacity(0.3);
+      case '👀':
+        return Colors.purple.withOpacity(0.3);
+      case '🖕':
+        return Colors.redAccent.withOpacity(0.3);
+      case '💋':
+        return Colors.pink.withOpacity(0.3);
+      case '🥇':
+        return Colors.amberAccent.withOpacity(0.3);
+      default:
+        return Colors.white12;
+    }
+  }
+
+  void _showChatToast(Map<String, dynamic> message) {
+    if (!mounted) return;
+    chatToastTimer?.cancel();
+    chatToastAnimationController.stop();
+    chatToastAnimationController.reset();
+
+    setState(() {
+      chatToastMessage = message;
+    });
+
+    chatToastAnimationController.forward();
+    chatToastTimer = Timer(const Duration(seconds: 8), () {
+      if (mounted) {
+        chatToastAnimationController.stop();
+        setState(() {
+          chatToastMessage = null;
+        });
+      }
+    });
+  }
+
+  void _scrollChatToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!chatScrollController.hasClients) return;
+      chatScrollController.animateTo(
+        chatScrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  int? _normalizeMessageId(dynamic value) {
+    if (value == null) return null;
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value);
+    return null;
+  }
+
+  void _ingestChatMessages(
+    List<Map<String, dynamic>> messages, {
+    bool enableToast = true,
+  }) {
+    if (messages.isEmpty) {
+      print('📥 _ingestChatMessages: Liste vide, ignoré');
+      return;
+    }
+    
+    print('📥 _ingestChatMessages: ${messages.length} message(s) à traiter');
+    final toAppend = <Map<String, dynamic>>[];
+
+    for (final message in messages) {
+      final normalized = Map<String, dynamic>.from(message);
+      final messageId = _normalizeMessageId(normalized['id']);
+      final pseudo = normalized['pseudo'] as String? ?? 'Joueur';
+      final messageText = normalized['message'] as String? ?? '';
+      
+      print('   📨 Message: pseudo=$pseudo, id=$messageId, texte="$messageText"');
+      print('      Est l\'expéditeur: ${pseudo == widget.currentPlayerName}');
+      
+      // ✅ SIMPLIFICATION: Vérification uniquement par messageId
+      if (messageId != null) {
+        if (_knownChatMessageIds.contains(messageId)) {
+          print('      ⚠️ Message déjà connu (ID: $messageId), ignoré');
+          continue; // Message déjà connu, ignorer
+        }
+        print('      ✅ Nouveau message, ajouté (ID: $messageId)');
+        _knownChatMessageIds.add(messageId);
+        _lastChatMessageId = _lastChatMessageId == null
+            ? messageId
+            : math.max(_lastChatMessageId!, messageId);
+        normalized['id'] = messageId;
+      } else {
+        print('      ⚠️ MessageId null, utilisation d\'un ID temporaire');
+      }
+      
+      toAppend.add(normalized);
+    }
+
+    if (toAppend.isEmpty) {
+      print('   ❌ Aucun message à ajouter après déduplication');
+      return;
+    }
+    
+    if (!mounted) {
+      print('   ❌ Widget non monté, impossible d\'ajouter les messages');
+      return;
+    }
+    
+    print('   ✅ Ajout de ${toAppend.length} message(s) à chatMessages');
+    print('      Avant: ${chatMessages.length} messages');
+    setState(() {
+      chatMessages.addAll(toAppend);
+      if (chatMessages.length > 120) {
+        chatMessages = chatMessages.sublist(chatMessages.length - 120);
+      }
+    });
+    print('      Après: ${chatMessages.length} messages');
+
+    final lastMessage = toAppend.last;
+    // ✅ Afficher le toast pour TOUS les messages (y compris ceux de l'expéditeur)
+    if (enableToast) {
+      print('   🔔 Affichage du toast pour: ${lastMessage['pseudo']} (expéditeur: ${lastMessage['pseudo'] == widget.currentPlayerName ? "moi" : "autre"})');
+      _showChatToast(lastMessage);
+    }
+    _scrollChatToBottom();
+  }
+
+  Future<void> _fetchChatMessagesFromApi() async {
+    if (!mounted || gameSession.playWithBots || _isFetchingChat) {
+      // ✅ Réduire les logs verbeux pour le polling régulier
+      return;
+    }
+    final roomIdValue = int.tryParse(gameSession.roomId ?? '');
+    if (roomIdValue == null) {
+      return;
+    }
+
+    // ✅ Réduire les logs verbeux pour le polling régulier (seulement logger s'il y a des nouveaux messages)
+    _isFetchingChat = true;
+    try {
+      final response = await RoomChatApiService.instance.fetchMessages(
+        roomId: roomIdValue,
+        lastId: _lastChatMessageId,
+      );
+      if (response['success'] != true) {
+        final message = response['message'];
+        if (message is String && message.isNotEmpty) {
+          print('⚠️ Polling chat: $message');
+        }
+        return;
+      }
+
+      final rawMessages =
+          (response['messages'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+      if (rawMessages.isEmpty) {
+        // ✅ Réduire les logs verbeux pour le polling régulier
+        // print('📥 _fetchChatMessagesFromApi: Aucun nouveau message depuis l\'API');
+        return;
+      }
+
+      // ✅ Logger seulement s'il y a de nouveaux messages
+      print('📥 _fetchChatMessagesFromApi: ${rawMessages.length} nouveau(x) message(s) reçu(s) de l\'API');
+      final normalized = rawMessages.map((raw) {
+        final map = Map<String, dynamic>.from(raw);
+        map['id'] = _normalizeMessageId(map['id']) ?? map['id'];
+        map['pseudo'] =
+            (map['pseudo'] ?? map['player_name'] ?? 'Joueur').toString();
+        map['message'] = (map['message'] ?? '').toString();
+        map['message_type'] = (map['message_type'] ?? 'text').toString();
+        map['created_at'] =
+            map['created_at']?.toString() ?? DateTime.now().toIso8601String();
+        return map;
+      }).toList();
+
+      _ingestChatMessages(normalized);
+    } catch (e) {
+      print('⚠️ Erreur lors du polling du chat: $e');
+    } finally {
+      _isFetchingChat = false;
+    }
+  }
+
+  // ========== UI BUILDING ==========
+  
+  Widget _buildPlayerHand() {
+    final playerCards = cardManager.getPlayerCards(widget.currentPlayerName);
+    
+    // ✅ Debug: vérifier si les cartes existent (uniquement si problème réel)
+    if (playerCards.isEmpty && hasGameStarted) {
+      // Vérifier si toutes les cartes ont été jouées (état normal en fin de partie)
+      bool allCardsPlayed = true;
+      for (var hand in cardManager.distributedCards.values) {
+        if (hand.isNotEmpty) {
+          allCardsPlayed = false;
+          break;
+        }
+      }
+      
+      // Ne pas afficher le message si toutes les cartes ont été jouées (c'est normal)
+      if (!allCardsPlayed) {
+        print('⚠️ ATTENTION: Aucune carte trouvée pour ${widget.currentPlayerName}');
+        print('   Joueurs avec cartes: ${cardManager.distributedCards.keys.toList()}');
+        // Vérifier si le nom du joueur correspond exactement
+        for (final key in cardManager.distributedCards.keys) {
+          print('   - "$key" (identique: ${key == widget.currentPlayerName})');
+        }
+      }
+    }
+    
+    final currentPlayerCards = sortCardsForDisplay(playerCards);
+
+    return Positioned(
+      bottom: 20,
+      left: 0,
+      right: 0,
+      child: Container(
+        height: 80,
+        child: Center(
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: currentPlayerCards.map((card) {
+                return Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 1),
+                  child: _buildHandCard(card),
+                );
+              }).toList(),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHandCard(Map<String, dynamic> card) {
+    final isCurrentPlayerTurn =
+        cardManager.currentPlayerTurn == widget.currentPlayerName;
+    final isAnnouncementPhase = cardManager.isAnnouncementPhase;
+
+    final playerCards = cardManager.getPlayerCards(widget.currentPlayerName);
+
+    // ✅ Vérifier si le joueur est déjà en train de jouer une carte (verrouillage de la main)
+    final isPlayerPlaying = currentPlayerPlaying == widget.currentPlayerName;
+
+    // ✅ PRIORITÉ: Utiliser les cartes jouables du backend (source de vérité)
+    // Si le cache est vide, utiliser la logique locale comme fallback
+    final cardCode = card['code'] as String? ?? '';
+    bool isPlayable = false;
+    
+    if (isCurrentPlayerTurn && !isAnnouncementPhase && !isPlayerPlaying) {
+      if (_playableCardCodes.isNotEmpty) {
+        // Utiliser le cache du backend
+        isPlayable = _playableCardCodes.contains(cardCode);
+      } else {
+        // Fallback: utiliser la logique locale
+        gameLogic.syncCurrentTrick(cardManager.currentTrick);
+        final localPlayable = gameLogic.getPlayableCards(
+          playerCards,
+          widget.currentPlayerName,
+          gameLogic.currentTrick.isEmpty,
+        );
+        isPlayable = localPlayable.contains(card);
+      }
+    }
+    
+    // ✅ Mettre à jour le cache des cartes jouables si nécessaire
+    // ⚠️ COMMENTÉ: Appel dans Future.microtask (closure) - problème de résolution du compilateur
+    // if (isCurrentPlayerTurn && !isAnnouncementPhase && !_isUpdatingPlayableCards) {
+    //   Future.microtask(() => this.updatePlayableCardsFromBackend());
+    // }
+
+    final isAnimating = isAnimatingCard &&
+        animatedCard != null &&
+        animatingPlayerName == widget.currentPlayerName &&
+        animatedCard!['code'] == card['code'];
+
+    if (isAnimating) {
+      return Opacity(
+        opacity: 0.0,
+        child: Container(width: 55, height: 80),
+      );
+    }
+    
+    // ✅ Capturer 'this' avant la closure pour forcer la résolution
+    final self = this;
+    return GestureDetector(
+      onTap: isPlayable ? () async {
+        // ✅ Vérifier une dernière fois que la carte est jouable avant de jouer
+        if (_playableCardCodes.isNotEmpty && !_playableCardCodes.contains(cardCode)) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Cette carte ($cardCode) n\'est plus jouable.'),
+              duration: const Duration(seconds: 2),
+              backgroundColor: Colors.orange,
+            ),
+          );
+          // ⚠️ COMMENTÉ: Appel dans onTap closure - problème de résolution du compilateur
+          // Mettre à jour le cache
+          // if (self.mounted) {
+          //   await self._updatePlayableCardsFromBackend();
+          // }
+          return;
+        }
+        await playCard(card);
+        // ⚠️ COMMENTÉ: Appel dans onTap closure - problème de résolution du compilateur
+        // ✅ Mettre à jour le cache après avoir joué une carte
+        // if (self.mounted) {
+        //   await self._updatePlayableCardsFromBackend();
+        // }
+      } : null,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        width: 55,
+        height: isPlayable ? 85 : 80,
+        margin: EdgeInsets.only(bottom: isPlayable ? 5 : 0),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: isPlayable ? Colors.green : Colors.grey.shade400,
+            width: isPlayable ? 2 : 1,
+          ),
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: Image.asset(
+            cardManager.getCardImagePath(card),
+            fit: BoxFit.cover,
+            errorBuilder: (context, error, stackTrace) {
+              return Container(
+                color: Colors.white,
+                child: Center(
+                  child: Text(
+                    card['code'] ?? '??',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPlayers() {
+    if (gameSession.players.isEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        loadPlayersFromBackend();
+      });
+      return const SizedBox.shrink();
+    }
+
+    final playersFromPerspective = getPlayersFromCurrentPerspective();
+    if (playersFromPerspective.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Stack(
+      children: playersFromPerspective
+          .map((player) => _buildPlayer(player))
+          .toList(),
+    );
+  }
+
+  Widget _buildPlayer(Map<String, dynamic> player) {
+    final position = player['displayPosition'] as String? ?? 'bottom';
+    Alignment alignment;
+
+    switch (position) {
+      case 'top':
+        alignment = Alignment.topCenter;
+        break;
+      case 'left':
+        alignment = Alignment.centerLeft;
+        break;
+      case 'right':
+        alignment = Alignment.centerRight;
+        break;
+      case 'bottom':
+        alignment = Alignment.bottomCenter;
+        break;
+      default:
+        alignment = Alignment.center;
+    }
+
+    final current = cardManager.currentPlayerTurn;
+    final isCurrentTurn = current == player['name'];
+    final isThisCurrentPlayer = player['name'] == widget.currentPlayerName;
+
+    return Positioned.fill(
+      child: Align(
+        alignment: alignment,
+        child: Transform.translate(
+          offset: position == 'top' ? const Offset(0, -10) : Offset.zero,
+          child: Container(
+            margin: getPlayerMargin(position),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (position == 'bottom')
+                  _buildPlayerBottomWidget(player, isCurrentTurn, isThisCurrentPlayer)
+                else if (position == 'left')
+                  _buildPlayerLeftWidget(player)
+                else if (position == 'right')
+                  _buildPlayerRightWidget(player)
+                else
+                  _buildPlayerTopWidget(player),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPlayerBottomWidget(Map<String, dynamic> player, bool isCurrentTurn, bool isThisCurrentPlayer) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: const Color(0xFF8B4513),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 18,
+                height: 18,
+                decoration: BoxDecoration(
+                  color: Colors.yellow,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: const Center(
+                  child: Text(
+                    '♠',
+                    style: TextStyle(
+                      color: Colors.black,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                player['name'],
+                style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 16),
+        Container(
+          padding: const EdgeInsets.all(3),
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(
+              color: Colors.yellow.shade700,
+              width: 3,
+            ),
+          ),
+          child: CircleAvatar(
+            radius: 30,
+            backgroundColor: Colors.white,
+            child: Text(player['avatar'], style: const TextStyle(fontSize: 24)),
+          ),
+        ),
+        const SizedBox(width: 16),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(color: const Color(0xFF8B4513), borderRadius: BorderRadius.circular(12)),
+          child: Text(
+            getPlayerAnnouncementDisplay(player['name']),
+            style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(color: const Color(0xFF8B4513), borderRadius: BorderRadius.circular(12)),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.diamond, color: Colors.blue, size: 16),
+              const SizedBox(width: 4),
+              Text(
+                getPlayerGlobalScore(player['name']).toString(),
+                style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPlayerLeftWidget(Map<String, dynamic> player) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(color: const Color(0xFF8B4513), borderRadius: BorderRadius.circular(12)),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 18,
+                height: 18,
+                decoration: BoxDecoration(
+                  color: Colors.yellow,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: const Center(
+                  child: Text(
+                    '♠',
+                    style: TextStyle(
+                      color: Colors.black,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(player['name'], style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
+            ],
+          ),
+        ),
+        const SizedBox(height: 8),
+        // Stack avec cartes en éventail et avatar (orienté vers la droite)
+        SizedBox(
+          width: 120,
+          height: 100,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              // Cartes en éventail derrière l'avatar (orienté vers la droite)
+              ...List.generate(getPlayerCardCount(player['name']), (index) {
+                final cardCount = getPlayerCardCount(player['name']);
+                final angle = cardCount > 0
+                    ? (index - (cardCount - 1) / 2) * 0.12
+                    : 0.0;
+                final radius = 35.0;
+                final centerX = 60.0;
+                final centerY = 50.0;
+                final cardX = centerX + radius * math.cos(angle) - 17.5;
+                final cardY = centerY + radius * math.sin(angle) - 25;
+                return Positioned(
+                  left: cardX,
+                  top: cardY,
+                  child: Transform.rotate(
+                    angle: angle,
+                    child: cardManager.buildCardBack(width: 40, height: 55),
+                  ),
+                );
+              }),
+              // Avatar circulaire au centre
+              CircleAvatar(
+                radius: 30,
+                backgroundColor: Colors.white,
+                child: Text(player['avatar'], style: const TextStyle(fontSize: 24)),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 4),
+        // Compteurs dynamiques sous l'avatar
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF8B4513),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                getPlayerAnnouncementDisplay(player['name']),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF8B4513),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.diamond, color: Colors.blue, size: 14),
+                  const SizedBox(width: 4),
+                  Text(
+                    getPlayerGlobalScore(player['name']).toString(),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPlayerRightWidget(Map<String, dynamic> player) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(color: const Color(0xFF8B4513), borderRadius: BorderRadius.circular(12)),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 18,
+                height: 18,
+                decoration: BoxDecoration(
+                  color: Colors.yellow,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: const Center(
+                  child: Text(
+                    '♠',
+                    style: TextStyle(
+                      color: Colors.black,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(player['name'], style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
+            ],
+          ),
+        ),
+        const SizedBox(height: 8),
+        // Stack avec cartes en éventail et avatar (orienté vers la gauche)
+        SizedBox(
+          width: 120,
+          height: 100,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              // Cartes en éventail derrière l'avatar (orienté vers la gauche)
+              ...List.generate(getPlayerCardCount(player['name']), (index) {
+                final cardCount = getPlayerCardCount(player['name']);
+                final angle = cardCount > 0
+                    ? (index - (cardCount - 1) / 2) * 0.12
+                    : 0.0;
+                final radius = 35.0;
+                final centerX = 60.0;
+                final centerY = 50.0;
+                final cardX = centerX - radius * math.cos(angle) - 17.5;
+                final cardY = centerY + radius * math.sin(angle) - 25;
+                return Positioned(
+                  left: cardX,
+                  top: cardY,
+                  child: Transform.rotate(
+                    angle: -angle,
+                    child: cardManager.buildCardBack(width: 40, height: 55),
+                  ),
+                );
+              }),
+              // Avatar circulaire au centre
+              CircleAvatar(
+                radius: 30,
+                backgroundColor: Colors.white,
+                child: Text(player['avatar'], style: const TextStyle(fontSize: 24)),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 4),
+        // Compteurs dynamiques sous l'avatar
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF8B4513),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                getPlayerAnnouncementDisplay(player['name']),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF8B4513),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.diamond, color: Colors.blue, size: 14),
+                  const SizedBox(width: 4),
+                  Text(
+                    getPlayerGlobalScore(player['name']).toString(),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPlayerTopWidget(Map<String, dynamic> player) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        // Row avec Nom, compteur d'annonce et compteur de score (au-dessus de l'avatar)
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            // Conteneur pour le nom
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF8B4513),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 18,
+                    height: 18,
+                    decoration: BoxDecoration(
+                      color: Colors.yellow,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: const Center(
+                      child: Text(
+                        '♠',
+                        style: TextStyle(
+                          color: Colors.black,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    player['name'],
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            // Conteneur pour le compteur d'annonce
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF8B4513),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                getPlayerAnnouncementDisplay(player['name']),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            // Conteneur pour le compteur de score avec diamant
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF8B4513),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.diamond, color: Colors.blue, size: 16),
+                  const SizedBox(width: 4),
+                  Text(
+                    getPlayerGlobalScore(player['name']).toString(),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        // Stack avec cartes en éventail et avatar (en dessous des compteurs)
+        SizedBox(
+          width: 150,
+          height: 120,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              // Cartes en éventail derrière l'avatar (rotation 90°)
+              ...List.generate(getPlayerCardCount(player['name']), (index) {
+                final cardCount = getPlayerCardCount(player['name']);
+                final angle = cardCount > 0
+                    ? (index - (cardCount - 1) / 2) * 0.12
+                    : 0.0;
+                final radius = 35.0;
+                final centerX = 75.0;
+                final centerY = 60.0;
+                final cardX = centerX - radius * math.sin(angle) - 17.5;
+                final cardY = centerY + radius * math.cos(angle) - 25;
+                return Positioned(
+                  left: cardX,
+                  top: cardY,
+                  child: Transform.rotate(
+                    angle: angle,
+                    child: cardManager.buildCardBack(width: 30, height: 42),
+                  ),
+                );
+              }),
+              // Avatar circulaire au centre
+              CircleAvatar(
+                radius: 30,
+                backgroundColor: Colors.white,
+                child: Text(player['avatar'], style: const TextStyle(fontSize: 24)),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCenterTrick() {
+    // ✅ Ne pas afficher les cartes pendant la phase d'annonces
+    if (cardManager.isAnnouncementPhase) return const SizedBox.shrink();
+    
+    final currentTrick = cardManager.currentTrick;
+    if (currentTrick.isEmpty) return const SizedBox.shrink();
+
+    // ✅ DEBUG: Log les cartes présentes dans le trick pour diagnostiquer les cartes manquantes
+    final expectedCount = cardManager.expectedPlayerCount;
+    if (currentTrick.length != expectedCount && currentTrick.length > 0) {
+      print('⚠️ _buildCenterTrick: Trick incomplet - ${currentTrick.length}/$expectedCount cartes');
+      print('   Cartes présentes:');
+      for (int i = 0; i < currentTrick.length; i++) {
+        final play = currentTrick[i];
+        final player = play['player'] as String? ?? 'Inconnu';
+        final card = play['card'] as Map<String, dynamic>?;
+        final cardCode = card?['code'] as String? ?? 'N/A';
+        print('     [$i] $player → $cardCode');
+      }
+    }
+
+    return Positioned.fill(
+      child: Center(
+        child: SizedBox(
+          width: 220,
+          height: 220,
+          child: Stack(
+            alignment: Alignment.center,
+            children: currentTrick.asMap().entries.map((entry) {
+              final index = entry.key;
+              final play = entry.value;
+              try {
+                final playerName = play['player'] as String? ?? '';
+                final card = play['card'] as Map<String, dynamic>? ?? {};
+                
+                // ✅ Vérifier que la carte a bien un code (sinon elle ne s'affichera pas)
+                final cardCode = card['code'] as String?;
+                if (card.isEmpty || cardCode == null || cardCode.isEmpty) {
+                  print('⚠️ _buildCenterTrick: Carte invalide pour $playerName à l\'index $index');
+                  return const SizedBox.shrink();
+                }
+                
+                final pos = getDisplayPositionForPlayerName(playerName);
+                final winnerPos = isCollectingTrick && lastTrickWinner != null
+                    ? getDisplayPositionForPlayerName(lastTrickWinner!)
+                    : null;
+                return _buildCardAtPosition(card, pos, index, winnerPos);
+              } catch (e) {
+                print('❌ _buildCenterTrick: Erreur lors de l\'affichage de la carte à l\'index $index: $e');
+                return const SizedBox.shrink();
+              }
+            }).toList(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCardAtPosition(
+    Map<String, dynamic> card,
+    String position,
+    int index,
+    String? collectingTowardsPosition,
+  ) {
+    double rotation = 0;
+    double offsetX = 0, offsetY = 0;
+    bool shouldRotateCard = false;
+    double indexOffset = (index % 4) * 3;
+
+    switch (position) {
+      case 'top':
+        offsetY = -60 - indexOffset;
+        offsetX = indexOffset;
+        rotation = -0.1 + (index * 0.02);
+        break;
+      case 'bottom':
+        offsetY = 60 + indexOffset;
+        offsetX = -indexOffset;
+        rotation = 0.1 - (index * 0.02);
+        break;
+      case 'left':
+        offsetX = -60 - indexOffset;
+        offsetY = -indexOffset;
+        rotation = -0.2 + (index * 0.03);
+        shouldRotateCard = true;
+        break;
+      case 'right':
+        offsetX = 60 + indexOffset;
+        offsetY = indexOffset;
+        rotation = 0.2 - (index * 0.03);
+        shouldRotateCard = true;
+        break;
+    }
+
+    double collectDx = 0, collectDy = 0;
+    if (collectingTowardsPosition != null) {
+      switch (collectingTowardsPosition) {
+        case 'top':
+          collectDy = -200;
+          break;
+        case 'bottom':
+          collectDy = 200;
+          break;
+        case 'left':
+          collectDx = -200;
+          break;
+        case 'right':
+          collectDx = 200;
+          break;
+      }
+    }
+
+    return Positioned(
+      left: 110 + offsetX - 28,
+      top: 110 + offsetY - 40,
+      child: TweenAnimationBuilder<Offset>(
+        tween: Tween<Offset>(
+          begin: const Offset(0, 0),
+          end: isCollectingTrick
+              ? Offset(collectDx, collectDy)
+              : const Offset(0, 0),
+        ),
+        duration: const Duration(milliseconds: 500),
+        builder: (context, value, child) {
+          return Transform.translate(
+            offset: value,
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 500),
+              opacity: isCollectingTrick ? 0.0 : 1.0,
+              child: Transform.scale(
+                scale: 0.95 - (index * 0.01),
+                child: Transform.rotate(
+                  angle: rotation,
+                  child: _buildPlayedCard(card, rotate: shouldRotateCard),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildPlayedCard(Map<String, dynamic> card, {bool rotate = false}) {
+    final imagePath = cardManager.getCardImagePath(card);
+    final content = Container(
+      width: 56,
+      height: 80,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.black.withOpacity(0.2), width: 1),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Image.asset(imagePath, fit: BoxFit.cover, errorBuilder: (_, __, ___) {
+        return Container(
+          color: Colors.white,
+          child: Center(child: Text(card['code'] ?? '??', style: const TextStyle(fontWeight: FontWeight.bold))),
+        );
+      }),
+    );
+
+    if (rotate) {
+      return Transform.rotate(angle: math.pi / 2, child: content);
+    }
+    return content;
+  }
+
+  Widget _buildAnimatedCard() {
+    if (animatedCard == null || cardAnimation == null || animatingPlayerName == null) {
+      return const SizedBox.shrink();
+    }
+
+    final playerPosition = getDisplayPositionForPlayerName(animatingPlayerName!);
+    final screenWidth = MediaQuery.of(context).size.width;
+    final screenHeight = MediaQuery.of(context).size.height;
+
+    double startX = screenWidth / 2;
+    double startY = screenHeight / 2;
+
+    switch (playerPosition) {
+      case 'bottom':
+        startY = screenHeight - 150;
+        startX = screenWidth / 2;
+        break;
+      case 'right':
+        startX = screenWidth - 100;
+        startY = screenHeight / 2;
+        break;
+      case 'top':
+        startY = 150;
+        startX = screenWidth / 2;
+        break;
+      case 'left':
+        startX = 100;
+        startY = screenHeight / 2;
+        break;
+    }
+
+    final centerX = screenWidth / 2;
+    final centerY = screenHeight / 2;
+
+    return AnimatedBuilder(
+      animation: cardAnimation!,
+      builder: (context, child) {
+        final currentY = startY + (centerY - startY) * cardAnimation!.value;
+        final currentX = startX + (centerX - startX) * cardAnimation!.value;
+        final scale = 1.0 + (cardAnimation!.value * 0.3);
+        final rotation = (cardAnimation!.value * 0.1);
+
+        return Positioned(
+          left: currentX - 30,
+          top: currentY - 42,
+          child: Transform.scale(
+            scale: scale,
+            child: Transform.rotate(
+              angle: rotation,
+              child: Container(
+                width: 60,
+                height: 85,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white, width: 2),
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: Image.asset(
+                    cardManager.getCardImagePath(animatedCard!),
+                    fit: BoxFit.cover,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildGameControls() {
+    return Stack(
+      children: [
+        Positioned(
+          top: 20,
+          left: 20,
+          child: _buildControlButton(
+            icon: Icons.list,
+            onTap: () => _showGameMenu(),
+          ),
+        ),
+        Positioned(
+          top: 20,
+          right: 20,
+          child: _buildControlButton(
+            icon: Icons.exit_to_app,
+            onTap: () => _showLeaveGameConfirmation(),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildControlButton({
+    required IconData icon,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 50,
+        height: 50,
+        decoration: BoxDecoration(
+          color: const Color(0xFF8B4513).withOpacity(0.9),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white, width: 1),
+        ),
+        child: Icon(icon, color: Colors.white, size: 20),
+      ),
+    );
+  }
+
+  Widget _buildRoomInfo() {
+    return Positioned(
+      top: 20,
+      left: 80,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.7),
+          borderRadius: BorderRadius.circular(15),
+        ),
+        child: Column(
+          children: [
+            Text(
+              widget.roomName,
+              style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
+            ),
+            Text(
+              'Code: ${widget.roomCode} • Mise: ${widget.minimumBet} cauris',
+              style: const TextStyle(color: Colors.grey, fontSize: 10),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTurnMessage() {
+    return const SizedBox.shrink();
+  }
+
+  Widget _buildAnnouncementPanel() {
+    final isAnnouncementPhase = cardManager.isAnnouncementPhase;
+    if (!isAnnouncementPhase) return const SizedBox.shrink();
+
+    // ✅ NOUVEAU: Système simultané - afficher le panneau pour tous les joueurs
+    // Le panneau est visible si la phase est active ET que le joueur n'a pas encore soumis
+    final announcements = cardManager.getCurrentRoundAnnouncements();
+    final hasCurrentPlayerAnnounced = announcements.any(
+      (ann) => ann['player'] == widget.currentPlayerName,
+    );
+
+    // ✅ Si le joueur a déjà fait son annonce, afficher un message d'attente au lieu du panneau
+    if (hasCurrentPlayerAnnounced || _hasAnnounced) {
+      return _buildWaitingForOthersPanel();
+    }
+
+    // ✅ Vérifier que le timer est toujours actif (countdown > 0)
+    if (announcementCountdown <= 0 && _announcementPhaseStartTimestamp == null) {
+      return const SizedBox.shrink();
+    }
+
+    // ✅ Afficher le panneau pour le joueur local (système simultané)
+    return _buildCurrentPlayerAnnouncementPanel();
+  }
+
+  // ✅ NOUVEAU: Panneau d'attente quand le joueur a déjà soumis son annonce
+  Widget _buildWaitingForOthersPanel() {
+    final announcements = cardManager.getCurrentRoundAnnouncements();
+    final submittedCount = announcements.length;
+    
+    return Positioned(
+      bottom: 120,
+      left: 20,
+      right: 20,
+      child: Center(
+        child: Container(
+          width: 280,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFFF5E6D3),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: const Color(0xFF8B4513), width: 1.5),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Annonce soumise',
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF8B4513),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'En attente des autres joueurs...\n($submittedCount/4)',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 14,
+                  color: Color(0xFF8B4513),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCurrentPlayerAnnouncementPanel() {
+    if (!cardManager.isAnnouncementPhase) return const SizedBox.shrink();
+
+    return Positioned(
+      bottom: 120,
+      left: 20,
+      right: 20,
+      child: Center(
+        child: Container(
+          width: 280,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFFF5E6D3),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: const Color(0xFF8B4513), width: 1.5),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.15),
+                blurRadius: 4,
+                offset: const Offset(0, 2),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Combien de plis gagnerez-vous ?',
+                      style: const TextStyle(
+                        color: Colors.black,
+                        fontSize: 14,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  // ✅ Afficher uniquement le compte à rebours (rond du minuteur)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: announcementCountdown <= 10 ? Colors.red : Colors.green,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      '$announcementCountdown',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              if (!hasAnnounced) ...[
+                // Slider avec labels de nombres visibles
+                Column(
+                  children: [
+                    // Labels des nombres au-dessus du slider
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: List.generate(12, (index) {
+                          final value = index + 2; // 2 à 13
+                          final isSelected = value == currentAnnouncement;
+                          return Expanded(
+                            child: Center(
+                              child: Text(
+                                value.toString(),
+                                style: TextStyle(
+                                  color: isSelected ? const Color(0xFF8B4513) : Colors.grey.shade600,
+                                  fontSize: 12,
+                                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                ),
+                              ),
+                            ),
+                          );
+                        }),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    // Slider
+                    SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        activeTrackColor: const Color(0xFF8B4513),
+                        inactiveTrackColor: Colors.grey.shade300,
+                        thumbColor: const Color(0xFF8B4513),
+                        overlayColor: const Color(0xFF8B4513).withOpacity(0.2),
+                        trackHeight: 4,
+                        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 12),
+                      ),
+                      child: Slider(
+                        value: currentAnnouncement.toDouble(),
+                        min: 2,
+                        max: 13,
+                        divisions: 11,
+                        label: currentAnnouncement.toString(),
+                        onChanged: (value) {
+                          setState(() {
+                            currentAnnouncement = value.toInt();
+                          });
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                // Contrôles : - | Nombre | + | Valider
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    // Bouton -
+                    Material(
+                      color: const Color(0xFF8B4513),
+                      borderRadius: BorderRadius.circular(8),
+                      child: InkWell(
+                        onTap: () {
+                          if (currentAnnouncement > 2) {
+                            setState(() {
+                              currentAnnouncement--;
+                            });
+                          }
+                        },
+                        borderRadius: BorderRadius.circular(8),
+                        child: Container(
+                          width: 50,
+                          height: 50,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF8B4513),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.white, width: 1),
+                          ),
+                          child: const Icon(Icons.remove, color: Colors.white, size: 24),
+                        ),
+                      ),
+                    ),
+                    // Affichage du nombre central
+                    Container(
+                      width: 80,
+                      height: 80,
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: const Color(0xFF8B4513), width: 3),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.2),
+                            blurRadius: 8,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: Center(
+                        child: Text(
+                          currentAnnouncement.toString(),
+                          style: const TextStyle(
+                            color: Colors.black,
+                            fontSize: 36,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+                    // Bouton +
+                    Material(
+                      color: const Color(0xFF8B4513),
+                      borderRadius: BorderRadius.circular(8),
+                      child: InkWell(
+                        onTap: () {
+                          if (currentAnnouncement < 13) {
+                            setState(() {
+                              currentAnnouncement++;
+                            });
+                          }
+                        },
+                        borderRadius: BorderRadius.circular(8),
+                        child: Container(
+                          width: 50,
+                          height: 50,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF8B4513),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.white, width: 1),
+                          ),
+                          child: const Icon(Icons.add, color: Colors.white, size: 24),
+                        ),
+                      ),
+                    ),
+                    // Bouton Valider (checkmark vert)
+                    Material(
+                      color: Colors.green,
+                      borderRadius: BorderRadius.circular(25),
+                      child: InkWell(
+                        onTap: () {
+                          _makeAnnouncementWithTimer(currentAnnouncement);
+                        },
+                        borderRadius: BorderRadius.circular(25),
+                        child: Container(
+                          width: 50,
+                          height: 50,
+                          decoration: BoxDecoration(
+                            color: Colors.green,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.white, width: 2),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.3),
+                                blurRadius: 8,
+                                offset: const Offset(0, 4),
+                              ),
+                            ],
+                          ),
+                          child: const Icon(Icons.check, color: Colors.white, size: 28),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ] else ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.green.shade100,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: Colors.green.shade300),
+                  ),
+                  child: Text(
+                    'Annonce faite: ${_getPlayerAnnouncement()}/X',
+                    style: TextStyle(
+                      color: Colors.green.shade800,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  int _getPlayerAnnouncement() {
+    final announcements = cardManager.getCurrentRoundAnnouncements();
+    final playerAnnouncement = announcements.firstWhere(
+      (ann) => ann['player'] == widget.currentPlayerName,
+      orElse: () => <String, Object>{'announcement': 0},
+    );
+    return playerAnnouncement['announcement'] as int;
+  }
+
+  Future<void> _makeAnnouncementWithTimer(int announcement) async {
+    // ✅ NOUVEAU: Utiliser le backend pour gérer les annonces (système simultané)
+    final playerName = widget.currentPlayerName;
+    final int clampedAnnouncement = announcement.clamp(2, 13).toInt();
+    
+    print('📤 Envoi annonce au backend: $playerName → $clampedAnnouncement plis');
+    
+    try {
+      // ✅ Utiliser le game_id stocké depuis announcement_phase_started
+      // ✅ CORRECTION: Si gameId est null, essayer de le récupérer via l'API
+      var gameId = _currentGameId;
+      final roundNumber = gameSession.currentRound;
+      
+      // ✅ Si gameId est null, essayer de le récupérer via getGameId() (appel API)
+      if (gameId == null) {
+        try {
+          gameId = await getGameId();
+          if (gameId != null) {
+            _currentGameId = gameId; // Stocker pour les prochaines annonces
+            print('✅ gameId récupéré via API: $gameId');
+          }
+        } catch (e) {
+          print('⚠️ Erreur lors de la récupération du gameId via API: $e');
+        }
+      }
+      
+      // ✅ Vérifier que les valeurs sont valides
+      if (gameId == null) {
+        print('❌ Impossible d\'obtenir le gameId (phase d\'annonces non démarrée?)');
+        // ✅ Ne pas bloquer l'utilisateur, juste logger l'erreur
+        // L'annonce sera gérée par le timeout si nécessaire
+        return;
+      }
+      
+      if (roundNumber < 1) {
+        print('❌ roundNumber invalide: $roundNumber (doit être >= 1)');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Erreur: Numéro de round invalide'),
+            duration: const Duration(seconds: 2),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+            margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          ),
+        );
+        return;
+      }
+      
+      if (clampedAnnouncement < 2 || clampedAnnouncement > 13) {
+        print('❌ announcementValue invalide: $clampedAnnouncement (doit être entre 2 et 13)');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Erreur: La valeur d\'annonce doit être entre 2 et 13 plis'),
+            duration: const Duration(seconds: 2),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+            margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          ),
+        );
+        return;
+      }
+      
+      print('✅ Validation OK: gameId=$gameId, roundNumber=$roundNumber, announcementValue=$clampedAnnouncement');
+      
+      // ✅ Envoyer l'annonce au backend (système simultané)
+      await GameApiService.instance.makeAnnouncement(
+        gameId: gameId,
+        roundNumber: roundNumber,
+        announcementValue: clampedAnnouncement,
+      );
+      
+      print('✅ Annonce envoyée au backend avec succès');
+      
+      // ✅ Mettre à jour l'état local (l'annonce sera aussi reçue via WebSocket)
+      if (mounted) {
+        setState(() {
+          hasAnnounced = true;
+          currentAnnouncement = clampedAnnouncement;
+        });
+      } else {
+        hasAnnounced = true;
+        currentAnnouncement = clampedAnnouncement;
+      }
+      
+      // ✅ Le backend enverra l'événement WebSocket announcement_submitted
+      // qui sera traité par le listener
+      
+    } catch (e) {
+      print('❌ Erreur lors de l\'envoi de l\'annonce au backend: $e');
+      
+      // ✅ CORRECTION: En cas d'erreur, enregistrer l'annonce localement comme fallback
+      // Le timeout ou le backend assignera l'annonce si nécessaire
+      // Mais on l'enregistre localement pour que l'UI soit cohérente
+      final announcements = cardManager.getCurrentRoundAnnouncements();
+      final alreadyInLocal = announcements.any(
+        (ann) => ann['player'] == playerName,
+      );
+      
+      if (!alreadyInLocal) {
+        print('⚠️ Enregistrement local de l\'annonce comme fallback (erreur API)');
+        cardManager.makeAnnouncement(playerName, clampedAnnouncement);
+        if (mounted) {
+          setState(() {
+            hasAnnounced = true;
+            currentAnnouncement = clampedAnnouncement;
+          });
+        }
+      }
+      
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Erreur lors de l\'envoi de l\'annonce. L\'annonce sera assignée automatiquement si nécessaire.'),
+          duration: const Duration(seconds: 3),
+          backgroundColor: Colors.orange,
+          behavior: SnackBarBehavior.floating,
+          margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        ),
+      );
+    }
+  }
+
+  // ✅ NOUVEAU: Envoyer l'annonce d'un bot au backend avec retry
+  Future<void> _sendBotAnnouncementWithRetry(String botName, {int maxRetries = 3}) async {
+    int attempts = 0;
+    Exception? lastError;
+    
+    while (attempts < maxRetries) {
+      try {
+        if (!mounted || !cardManager.isAnnouncementPhase) {
+          print('⚠️ Phase d\'annonces terminée, arrêt de l\'envoi pour $botName');
+          return;
+        }
+        
+        // Vérifier si le bot a déjà fait son annonce (peut-être via WebSocket entre-temps)
+        final announcements = cardManager.getCurrentRoundAnnouncements();
+        final alreadyAnnounced = announcements.any(
+          (ann) => ann['player'] == botName,
+        );
+        
+        if (alreadyAnnounced) {
+          print('✅ $botName a déjà fait son annonce (via WebSocket), ignoré');
+          return;
+        }
+        
+        final botAnnouncement = cardManager.getBotAnnouncement(botName);
+        final int clampedAnnouncement = botAnnouncement.clamp(2, 13).toInt();
+        print('🤖 [$botName] Tentative ${attempts + 1}/$maxRetries: annonce = $clampedAnnouncement plis');
+        
+        // ✅ Utiliser le game_id stocké depuis announcement_phase_started
+        final gameId = _currentGameId;
+        final roundNumber = gameSession.currentRound;
+        
+        if (gameId == null) {
+          print('⚠️ gameId null pour $botName (phase d\'annonces non démarrée?), nouvelle tentative dans 1 seconde...');
+          attempts++;
+          if (attempts < maxRetries) {
+            await Future.delayed(const Duration(seconds: 1));
+            continue;
+          }
+          throw Exception('Impossible d\'obtenir le gameId après $maxRetries tentatives (phase d\'annonces non démarrée?)');
+        }
+        
+        if (roundNumber < 1) {
+          print('⚠️ roundNumber invalide pour $botName: $roundNumber (doit être >= 1)');
+          attempts++;
+          if (attempts < maxRetries) {
+            await Future.delayed(const Duration(seconds: 1));
+            continue;
+          }
+          throw Exception('roundNumber invalide: $roundNumber');
+        }
+        
+        if (clampedAnnouncement < 2 || clampedAnnouncement > 13) {
+          print('⚠️ announcementValue invalide pour $botName: $clampedAnnouncement (doit être entre 2 et 13)');
+          throw Exception('announcementValue invalide: $clampedAnnouncement (doit être entre 2 et 13)');
+        }
+        
+        print('✅ Validation OK pour $botName: gameId=$gameId, roundNumber=$roundNumber, announcementValue=$clampedAnnouncement');
+        
+        // ✅ Envoyer l'annonce au backend
+        await GameApiService.instance.makeAnnouncement(
+          gameId: gameId,
+          roundNumber: roundNumber,
+          announcementValue: clampedAnnouncement,
+          playerName: botName, // ✅ Passer le nom du bot
+        );
+        
+        print('✅ Annonce du bot $botName envoyée au backend avec succès: $clampedAnnouncement plis');
+        
+        // Mettre à jour l'UI
+        if (mounted) {
+          setState(() {});
+        }
+        
+        return; // Succès, sortir de la boucle
+        
+      } catch (e) {
+        lastError = e is Exception ? e : Exception('$e');
+        attempts++;
+        
+        // ✅ CORRECTION: Si l'erreur indique que l'annonce a déjà été soumise (400), ne pas retry
+        final errorString = e.toString().toLowerCase();
+        final isAlreadySubmitted = errorString.contains('déjà soumis') || 
+                                   errorString.contains('already submitted') ||
+                                   errorString.contains('400');
+        
+        if (isAlreadySubmitted) {
+          print('✅ $botName a déjà soumis son annonce (erreur 400), arrêt des tentatives');
+          // Vérifier si l'annonce est dans l'état local, sinon l'ajouter
+          final announcements = cardManager.getCurrentRoundAnnouncements();
+          final alreadyInLocal = announcements.any(
+            (ann) => ann['player'] == botName,
+          );
+          if (!alreadyInLocal) {
+            // L'annonce a été soumise au backend mais n'est pas encore dans l'état local
+            // Elle sera ajoutée via l'événement WebSocket, donc on attend juste
+            print('   ⏳ Attente de l\'événement WebSocket pour synchroniser l\'annonce...');
+          }
+          return; // Sortir sans erreur car l'annonce a bien été soumise
+        }
+        
+        print('❌ Erreur annonce automatique bot $botName (tentative $attempts/$maxRetries): $e');
+        
+        if (attempts < maxRetries) {
+          // Attendre avant de réessayer (délai progressif)
+          final delay = Duration(milliseconds: 1000 * attempts);
+          print('⏳ Nouvelle tentative dans ${delay.inSeconds} seconde(s)...');
+          await Future.delayed(delay);
+        }
+      }
+    }
+    
+    // Si on arrive ici, toutes les tentatives ont échoué
+    print('❌ Échec définitif: Impossible d\'envoyer l\'annonce du bot $botName après $maxRetries tentatives');
+    if (lastError != null) {
+      print('   Dernière erreur: $lastError');
+    }
+  }
+
+  // ✅ NOUVEAU: Démarrer le minuteur de la phase d'annonces basé sur le timestamp serveur
+  void _startAnnouncementPhaseTimer(int startTimestamp, int duration) {
+    _announcementPhaseTimer?.cancel();
+    
+    // Calculer le temps restant basé sur le timestamp serveur
+    void updateCountdown() {
+      if (!mounted) return;
+      
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000; // Timestamp en secondes
+      final elapsed = now - startTimestamp;
+      final remaining = (duration - elapsed).clamp(0, duration);
+      
+      if (mounted) {
+        setState(() {
+          _announcementCountdown = remaining;
+        });
+      }
+      
+      // ✅ CORRECTION: Si le temps est écoulé, vérifier que tous les joueurs ont annoncé
+      // Si certains n'ont pas annoncé, leur assigner automatiquement 2 plis
+      if (remaining <= 0) {
+        _announcementPhaseTimer?.cancel();
+        
+        // ✅ Vérifier que tous les joueurs ont fait leur annonce (de manière asynchrone)
+        if (mounted && cardManager.isAnnouncementPhase) {
+          _handleAnnouncementPhaseTimeout();
+        }
+      }
+    }
+    
+    // Mettre à jour immédiatement
+    updateCountdown();
+    
+    // Mettre à jour chaque seconde
+    _announcementPhaseTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      updateCountdown();
+    });
+  }
+
+  // ✅ NOUVEAU: Gérer le timeout de la phase d'annonces simultanées
+  Future<void> _handleAnnouncementPhaseTimeout() async {
+    final allPlayers = gameSession.players
+        .map((p) => p['name'] as String? ?? 'Joueur')
+        .toList();
+    final announcements = cardManager.getCurrentRoundAnnouncements();
+    
+    for (final playerName in allPlayers) {
+      final hasAnnounced = announcements.any(
+        (ann) => ann['player'] == playerName,
+      );
+      
+      if (!hasAnnounced) {
+        print('⏰ Fin du timer de phase - $playerName n\'a pas annoncé, assignation automatique de 2 plis');
+        _forceAnnouncementForPlayer(playerName, 2);
+        
+        // ✅ Envoyer l'annonce au backend si c'est le joueur local
+        if (playerName == widget.currentPlayerName) {
+          try {
+            var gameId = _currentGameId;
+            if (gameId == null) {
+              gameId = await getGameId();
+            }
+            final roundNumber = gameSession.currentRound;
+            
+            if (gameId != null && roundNumber >= 1) {
+              await GameApiService.instance.makeAnnouncement(
+                gameId: gameId,
+                roundNumber: roundNumber,
+                announcementValue: 2,
+              );
+              print('✅ Annonce timeout (2 plis) envoyée au backend pour $playerName');
+            }
+          } catch (e) {
+            print('⚠️ Erreur lors de l\'envoi de l\'annonce timeout au backend: $e');
+            // L'annonce est déjà enregistrée localement, le backend la synchronisera via WebSocket
+          }
+        } else {
+          // ✅ Pour les autres joueurs, envoyer via WebSocket
+          sendAnnouncementTimeoutViaWebSocket(playerName);
+        }
+      }
+    }
+  }
+
+  void _forceAnnouncementForPlayer(String playerName, int announcement) {
+    final int clampedAnnouncement = announcement.clamp(2, 13).toInt();
+    if (playerName == widget.currentPlayerName) {
+      // ✅ Joueur local - annuler le timer et cacher le panneau
+      announcementTimer?.cancel();
+      cardManager.makeAnnouncement(playerName, clampedAnnouncement);
+      if (mounted) {
+        setState(() {
+          hasAnnounced = true;
+          currentAnnouncement = clampedAnnouncement;
+          // ✅ Réinitialiser currentAnnouncementPlayer pour cacher le panneau
+          currentAnnouncementPlayer = null;
+        });
+      } else {
+        hasAnnounced = true;
+        currentAnnouncement = clampedAnnouncement;
+        currentAnnouncementPlayer = null;
+      }
+    } else {
+      // ✅ Autre joueur - ne pas toucher au timer ni au panneau du joueur local
+      print('   ✅ Force annonce pour $playerName: $clampedAnnouncement plis');
+      cardManager.forceAnnouncement(playerName, clampedAnnouncement);
+      // ✅ Mettre à jour l'UI même pour les autres joueurs (pour afficher leur annonce)
+      if (mounted) {
+        setState(() {});
+      }
+    }
+  }
+  
+  // ✅ Surcharger startNewRound pour envoyer la distribution via WebSocket
+  @override
+  Future<void> startNewRound() async {
+    try {
+      final playerNames = gameSession.players
+          .map((p) => p['name'] as String? ?? 'Joueur')
+          .toList();
+
+      // ✅ Vérifier si c'est le créateur qui démarre la nouvelle manche
+      final isCreator = gameSession.players.any(
+        (p) => (p['name'] as String?) == widget.currentPlayerName &&
+            (p['isCreator'] as bool?) == true,
+      );
+
+      if (isCreator) {
+        // ✅ LE CRÉATEUR demande au backend de distribuer les cartes
+        print('👑 Créateur: demande de redistribution des cartes au backend...');
+        
+        // Réinitialiser l'état d'annonces/pli
+        cardManager.resetRoundCounters();
+        cardManager.clearCurrentTrick();
+        
+        final roomId = gameSession.roomId ?? '';
+        if (roomId.isEmpty) {
+          print('❌ Room ID manquant, impossible de redistribuer');
+          return;
+        }
+        
+        try {
+          // ✅ Appeler l'API backend pour distribuer les cartes
+          await GameApiService.instance.distributeCards(
+            roomId: roomId,
+            roundNumber: gameSession.currentRound + 1,
+            testMode: _useTestDistribution,
+          ).then((response) {
+            print('✅ Backend a redistribué les cartes: $response');
+            // La distribution sera reçue via WebSocket dans _cardDistributionSubscription
+          }).catchError((e) {
+            print('❌ Erreur lors de la demande de redistribution: $e');
+            print('❌ ERREUR CRITIQUE: Le backend n\'a pas pu redistribuer les cartes');
+            print('   La distribution locale est DÉSACTIVÉE - seul le backend peut distribuer');
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: const Text('Erreur: Impossible de redistribuer les cartes. Veuillez réessayer.'),
+                  backgroundColor: Colors.red,
+                  duration: const Duration(seconds: 5),
+                  behavior: SnackBarBehavior.floating,
+                  margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                ),
+              );
+            }
+          });
+        } catch (e) {
+          print('❌ Exception lors de la demande de redistribution: $e');
+          print('❌ ERREUR CRITIQUE: Exception lors de la redistribution');
+          print('   La distribution locale est DÉSACTIVÉE - seul le backend peut distribuer');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Erreur: Impossible de redistribuer les cartes. Veuillez réessayer.'),
+                backgroundColor: Colors.red,
+                duration: Duration(seconds: 5),
+              ),
+            );
+          }
+        }
+      } else {
+        // ✅ LES AUTRES JOUEURS attendent la distribution via WebSocket
+        // La distribution sera reçue via _cardDistributionSubscription
+        print('⏳ Attente de la redistribution depuis le créateur...');
+      }
+    } catch (e) {
+      print('❌ Erreur démarrage nouvelle manche: $e');
+    }
+  }
+
+  Widget _buildAnnouncementNotification() {
+    // ✅ Supprimé : Les compteurs de plis indiquent déjà qui a annoncé
+    // Pas besoin d'afficher un message supplémentaire
+    return const SizedBox.shrink();
+  }
+
+  void _showGameMenu() {
+    // Afficher directement le tableau de scores
+    final players = gameSession.players
+        .map((p) => p['name'] as String? ?? 'Joueur')
+        .toList();
+    
+    final announcements = cardManager.getCurrentRoundAnnouncements();
+    final Map<String, int> announcedByPlayer = {
+      for (final p in players)
+        p: (announcements.firstWhere(
+              (a) => a['player'] == p,
+              orElse: () => {'announcement': 0},
+            )['announcement'] as int? ?? 0),
+    };
+    
+    final Map<String, int> obtainedByPlayer = {
+      for (final p in players) p: cardManager.getObtainedTricks(p),
+    };
+    
+    final Map<String, int> scores = {};
+    for (final p in players) {
+      final a = announcedByPlayer[p] ?? 0;
+      final o = obtainedByPlayer[p] ?? 0;
+      int s = 0;
+      if (o == a) {
+        s = a * 10;
+      } else if (o < a) {
+        s = -(a * 10);
+      } else if (o > a && o <= a + 2) {
+        s = (a * 10) + (o - a);
+      } else if (o >= a + 3) {
+        s = -(a * 10);
+      }
+      scores[p] = s;
+    }
+    
+    showScoreboardDialog(
+      players,
+      announcedByPlayer,
+      obtainedByPlayer,
+      scores,
+      autoClose: false, // ✅ Joueur ouvre manuellement, pas de fermeture automatique
+    );
+  }
+
+  void _showLeaveGameConfirmation() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF2E2B23),
+        title: const Text('Quitter la partie?', style: TextStyle(color: Colors.white)),
+        content: const Text(
+          'Êtes-vous sûr de vouloir quitter la partie?',
+          style: TextStyle(color: Colors.white),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Annuler', style: TextStyle(color: Colors.white)),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              Navigator.of(context).pop();
+            },
+            child: const Text('Quitter', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Widget pour afficher les logs de débogage dans l'UI
+  Widget _buildDebugLogs() {
+    return Positioned(
+      top: 50,
+      right: 10,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          // Bouton pour activer/désactiver l'affichage des logs
+          GestureDetector(
+            onTap: () {
+              setState(() {
+                _showDebugLogs = !_showDebugLogs;
+              });
+            },
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: _showDebugLogs ? Colors.green : Colors.grey,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                _showDebugLogs ? '📋' : '📋',
+                style: const TextStyle(fontSize: 20),
+              ),
+            ),
+          ),
+          // Panneau de logs
+          if (_showDebugLogs)
+            Container(
+              width: 300,
+              height: 400,
+              margin: const EdgeInsets.only(top: 8),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black87,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white24),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text(
+                        'Logs Debug',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                        ),
+                      ),
+                      GestureDetector(
+                        onTap: () {
+                          setState(() {
+                            _debugLogs.clear();
+                          });
+                        },
+                        child: const Text(
+                          'Effacer',
+                          style: TextStyle(
+                            color: Colors.red,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const Divider(color: Colors.white24),
+                  Expanded(
+                    child: ListView.builder(
+                      reverse: true, // Afficher les plus récents en premier
+                      itemCount: _debugLogs.length,
+                      itemBuilder: (context, index) {
+                        final log = _debugLogs[_debugLogs.length - 1 - index];
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 2),
+                          child: Text(
+                            log,
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 10,
+                              fontFamily: 'monospace',
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}

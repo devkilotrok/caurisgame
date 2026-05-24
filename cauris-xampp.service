@@ -1,0 +1,16 @@
+[Unit]
+Description=Cauris XAMPP Stack (Apache & MySQL)
+After=network.target
+
+[Service]
+Type=forking
+User=root
+Group=root
+ExecStart=/opt/lampp/lampp start
+ExecStop=/opt/lampp/lampp stop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

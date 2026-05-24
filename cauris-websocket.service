@@ -1,0 +1,17 @@
+[Unit]
+Description=Cauris WebSocket Server (Socket.io)
+After=network.target
+
+[Service]
+Type=simple
+User=adolphe
+WorkingDirectory=/opt/lampp/htdocs/backendCauris/websocket-server
+ExecStart=/home/adolphe/.nvm/versions/node/v22.20.0/bin/node server.js
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/adolphe/websocket.log
+StandardError=append:/home/adolphe/websocket.log
+
+[Install]
+WantedBy=multi-user.target
+

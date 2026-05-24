@@ -1,0 +1,18 @@
+[Unit]
+Description=Cauris ngrok Tunnels
+After=network.target cauris-laravel.service cauris-websocket.service
+
+[Service]
+Type=simple
+User=adolphe
+Group=adolphe
+ExecStart=/usr/bin/env ngrok start --all --config /home/adolphe/.ngrok2/ngrok.yml
+Restart=always
+RestartSec=5
+WorkingDirectory=/home/adolphe
+StandardOutput=append:/home/adolphe/ngrok_all.log
+StandardError=append:/home/adolphe/ngrok_all.log
+
+[Install]
+WantedBy=multi-user.target
+
