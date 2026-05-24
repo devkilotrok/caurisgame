@@ -7,7 +7,11 @@ import '../../models/game/game_session.dart';
 import '../../models/game/local_card_manager.dart';
 import '../../models/game/game_logic.dart';
 import '../room/create_room_page.dart';
+import '../home/user_menu_page.dart';
 import '../../config/game_constants.dart';
+import '../../services/user/user_service.dart';
+import '../../services/api/user_api_service.dart';
+import '../../services/websocket/game_websocket_service.dart';
 
 /// Classe mère abstraite - Logique commune aux deux modes
 abstract class GameRoomBasePage extends StatefulWidget {
@@ -3770,6 +3774,47 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
 
   void _showContinueGameDialog() {
     // À implémenter dans les sous-classes si nécessaire
+  }
+
+  /// Quitte la partie et ramène l'utilisateur au tableau de bord (reste connecté).
+  Future<void> navigateToUserDashboard() async {
+    continueCountdownTimer?.cancel();
+
+    try {
+      await GameWebSocketService().disconnect();
+    } catch (_) {}
+
+    gameSession.isGameActive = false;
+    gameSession.isGameCompleted = true;
+
+    String pseudo =
+        UserService.instance.currentUserPseudo ?? widget.currentPlayerName;
+    int balance = 1000;
+
+    try {
+      final profile = await UserApiService.instance.getProfile();
+      if (profile['success'] == true) {
+        final user = profile['user'];
+        if (user is Map<String, dynamic>) {
+          pseudo = user['pseudo']?.toString() ?? pseudo;
+          balance = (user['cauris_balance'] as num?)?.toInt() ?? balance;
+        }
+      }
+    } catch (e) {
+      print('⚠️ Profil non rechargé avant retour dashboard: $e');
+    }
+
+    if (!mounted) return;
+
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(
+        builder: (_) => UserMenuPage(
+          pseudo: pseudo,
+          caurisBalance: balance,
+        ),
+      ),
+      (_) => false,
+    );
   }
 
 }

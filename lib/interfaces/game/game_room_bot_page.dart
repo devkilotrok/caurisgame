@@ -2617,9 +2617,7 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
 
   Future<void> _handleContinueGame(bool wantsToContinue) async {
     if (!wantsToContinue) {
-      if (mounted) {
-        Navigator.of(context).popUntil((route) => route.isFirst);
-      }
+      await navigateToUserDashboard();
       return;
     }
 
