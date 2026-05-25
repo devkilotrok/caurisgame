@@ -78,6 +78,7 @@ class LocalCardManager {
   bool _isAnnouncementPhase = true;
   List<Map<String, dynamic>> _currentRoundAnnouncements = [];
   int _currentTrickNumber = 0;
+  bool _isRoundEnding = false;
   List<Map<String, dynamic>> _currentTrick = [];
   String? _lastPlayerWithoutSpades;
   final Map<String, int> _obtainedTricks = {}; // plis gagnés par joueur pour la manche courante
@@ -524,10 +525,60 @@ class LocalCardManager {
     print('📊 Toutes les annonces ont été augmentées de +1');
   }
 
+  /// True si toutes les mains sont vides (manche terminée).
+  bool allCardsPlayed() {
+    if (_distributedCards.isEmpty) return false;
+    for (final hand in _distributedCards.values) {
+      if (hand.isNotEmpty) return false;
+    }
+    return true;
+  }
+
+  bool hasCardsRemaining(String playerName) {
+    return (_distributedCards[playerName] ?? []).isNotEmpty;
+  }
+
+  /// Passe au joueur suivant qui a encore des cartes (sens anti-horaire).
+  /// [preferredStart] : gagnant du pli s'il a encore des cartes, sinon joueur suivant.
+  /// Retourne false si la manche est terminée.
+  bool advanceToNextPlayerWithCards({String? preferredStart}) {
+    if (allCardsPlayed()) {
+      _isRoundEnding = true;
+      return false;
+    }
+
+    final players = _distributedCards.keys.toList();
+    if (players.isEmpty) return false;
+
+    if (preferredStart != null &&
+        preferredStart.isNotEmpty &&
+        hasCardsRemaining(preferredStart)) {
+      _currentPlayerTurn = preferredStart;
+      print('Tour (gagnant du pli): $_currentPlayerTurn');
+      return true;
+    }
+
+    final startIndex = players.indexOf(_currentPlayerTurn);
+    final baseIndex = startIndex >= 0 ? startIndex : 0;
+
+    for (int i = 1; i <= players.length; i++) {
+      final name = players[(baseIndex + i) % players.length];
+      if (hasCardsRemaining(name)) {
+        _currentPlayerTurn = name;
+        print('Tour passé à: $_currentPlayerTurn');
+        return true;
+      }
+    }
+
+    _isRoundEnding = true;
+    return false;
+  }
+
   // Fonction pour passer à la phase de jeu
   void startGamePhase() {
     _isAnnouncementPhase = false;
     _currentTrickNumber = 1;
+    _isRoundEnding = false;
     _currentTrick.clear();
     // Réinitialiser les compteurs de plis gagnés
     _obtainedTricks.clear();
@@ -601,7 +652,7 @@ class LocalCardManager {
       if (_currentTrick.length >= expectedTrickSize) {
         _finishTrick();
       } else {
-        _nextPlayer();
+        advanceToNextPlayerWithCards();
       }
     } else {
       if (_isAnnouncementPhase) {
@@ -667,71 +718,48 @@ class LocalCardManager {
     // Le backend gère déjà le tour et la fin du pli
   }
 
-  // Fonction pour passer au joueur suivant pendant le jeu
-  // SENS ANTI-HORAIRE (contre sens des aiguilles d'une montre)
-  void _nextPlayer() {
-    List<String> players = _distributedCards.keys.toList();
-    int currentIndex = players.indexOf(_currentPlayerTurn);
-    
-    // Sens anti-horaire: on incrémente (ordre direct)
-    int nextIndex = (currentIndex + 1) % players.length;
-    _currentPlayerTurn = players[nextIndex];
-    
-    print('Tour passé à: $_currentPlayerTurn');
-  }
-
   // Fonction pour terminer un pli
   // ✅ RÈGLE: Un round = exactement 13 tricks (4 joueurs × 13 cartes = 52 cartes)
   void _finishTrick() {
+    if (_isRoundEnding) return;
+
     print('Pli terminé: ${_currentTrick.length} cartes');
-    
-    // ✅ Vérifier si le trick a déjà été terminé (éviter les doubles appels)
-    final trickNumberBefore = _currentTrickNumber;
-    _currentTrickNumber++;
-    
-    // ✅ Validation: Un round ne peut pas avoir plus de 13 tricks
-    if (_currentTrickNumber > 13) {
-      print('⚠️ ATTENTION: Trick number dépasse 13 ($_currentTrickNumber). Un round = exactement 13 tricks.');
-      _currentTrickNumber = 13; // Limiter à 13
+
+    final completedTrick = _currentTrickNumber;
+    if (completedTrick > 13) {
+      print(
+        '⚠️ ATTENTION: plus de 13 plis comptabilisés ($completedTrick). Vérifier la logique de fin de manche.',
+      );
     }
-    
-    // Déterminer le gagnant du pli: carte la plus forte en suivant les règles
-    String winner = _determineTrickWinner();
+
+    final winner = _determineTrickWinner();
     if (winner.isNotEmpty) {
-      // ✅ Vérifier que le compteur n'a pas déjà été incrémenté (éviter les doubles incrémentations)
       final currentObtained = _obtainedTricks[winner] ?? 0;
       _obtainedTricks[winner] = currentObtained + 1;
-      print('✅ Pli gagné par $winner -> total: ${_obtainedTricks[winner]} (trick #$_currentTrickNumber/13)');
+      print(
+        '✅ Pli gagné par $winner -> total: ${_obtainedTricks[winner]} (trick #$completedTrick/13)',
+      );
     }
-    
-    // Vérifier si toutes les cartes ont été jouées
-    bool allCardsPlayed = true;
-    for (var hand in _distributedCards.values) {
-      if (hand.isNotEmpty) {
-        allCardsPlayed = false;
-        break;
-      }
-    }
-    
-    if (allCardsPlayed) {
+
+    final roundOver = allCardsPlayed();
+    if (roundOver) {
+      _isRoundEnding = true;
       print('🎉 TOUTES LES CARTES ONT ÉTÉ JOUÉES ! MANCHE TERMINÉE !');
       final announcements = getCurrentRoundAnnouncements();
       final obtained = Map<String, int>.from(_obtainedTricks);
-      if (onRoundCompleted != null) {
-        onRoundCompleted!(announcements, obtained);
-      }
-    }
-    
-    // Laisser le pli COMPLET visible un court instant avant d'effacer
-    // pour permettre l'affichage des 4 cartes au centre.
-    if (winner.isNotEmpty && !allCardsPlayed) {
-      _currentPlayerTurn = winner;
-    } else if (!allCardsPlayed) {
-      _nextPlayer();
+      onRoundCompleted?.call(announcements, obtained);
+      return;
     }
 
-    // Note: Le trick sera vidé explicitement par clearCurrentTrick() après l'animation complète
-    // On ne vide plus ici automatiquement pour éviter les conflits de timing
+    if (completedTrick < 13) {
+      _currentTrickNumber = completedTrick + 1;
+    }
+
+    if (winner.isNotEmpty) {
+      advanceToNextPlayerWithCards(preferredStart: winner);
+    } else {
+      advanceToNextPlayerWithCards();
+    }
   }
 
   // Getter: nombre de plis remportés
@@ -752,67 +780,35 @@ class LocalCardManager {
   // ✅ Méthode pour forcer la fin d'un pli et mettre à jour les compteurs (pour synchronisation)
   // ⚠️ IMPORTANT: Cette méthode ne doit être appelée QUE si _finishTrick() n'a PAS été appelé
   void forceFinishTrick(String winnerName) {
-    if (winnerName.isEmpty) return;
-    
-    // ✅ Vérifier si le trick a déjà été terminé (éviter les doubles incrémentations)
+    if (winnerName.isEmpty || _isRoundEnding) return;
+
     final currentObtained = _obtainedTricks[winnerName] ?? 0;
-    final trickNumberBefore = _currentTrickNumber;
-    
-    print('🔧 Force finish trick pour $winnerName (trick #$trickNumberBefore)');
-    print('   Compteur actuel: $currentObtained plis');
-    
-    // ✅ Incrémenter le numéro de pli seulement si nécessaire
-    // On vérifie si le trick actuel est vide (signe qu'il a déjà été terminé)
-    if (_currentTrick.isEmpty && trickNumberBefore > 0) {
-      // Le trick a déjà été vidé, donc il a déjà été terminé
-      // On ne doit incrémenter que si le numéro de pli n'a pas encore été incrémenté
-      if (trickNumberBefore == _currentTrickNumber) {
-        _currentTrickNumber++;
-      }
-    } else {
-      // Le trick n'est pas encore vide, on peut incrémenter normalement
-      if (trickNumberBefore == _currentTrickNumber) {
-        _currentTrickNumber++;
-      }
-    }
-    
-    // ✅ Validation: Un round ne peut pas avoir plus de 13 tricks
-    if (_currentTrickNumber > 13) {
-      print('⚠️ ATTENTION: Trick number dépasse 13 ($_currentTrickNumber). Un round = exactement 13 tricks.');
-      _currentTrickNumber = 13; // Limiter à 13
-    }
-    
-    // ✅ Mettre à jour le compteur du gagnant
-    // On incrémente toujours le compteur car c'est un nouveau pli gagné
+    final completedTrick = _currentTrickNumber;
+
+    print('🔧 Force finish trick pour $winnerName (trick #$completedTrick)');
+
     final expectedObtained = currentObtained + 1;
-    if (_obtainedTricks[winnerName] == null || _obtainedTricks[winnerName]! < expectedObtained) {
+    if (_obtainedTricks[winnerName] == null ||
+        _obtainedTricks[winnerName]! < expectedObtained) {
       _obtainedTricks[winnerName] = expectedObtained;
-      print('✅ Pli forcé gagné par $winnerName -> total: ${_obtainedTricks[winnerName]}');
-    } else {
-      print('ℹ️ Compteur déjà à jour pour $winnerName: ${_obtainedTricks[winnerName]} plis');
+      print(
+        '✅ Pli forcé gagné par $winnerName -> total: ${_obtainedTricks[winnerName]} (trick #$completedTrick/13)',
+      );
     }
-    
-    // Vérifier si toutes les cartes ont été jouées
-    bool allCardsPlayed = true;
-    for (var hand in _distributedCards.values) {
-      if (hand.isNotEmpty) {
-        allCardsPlayed = false;
-        break;
-      }
-    }
-    
-    if (allCardsPlayed) {
+
+    if (allCardsPlayed()) {
+      _isRoundEnding = true;
       print('🎉 TOUTES LES CARTES ONT ÉTÉ JOUÉES ! MANCHE TERMINÉE !');
       final announcements = getCurrentRoundAnnouncements();
       final obtained = Map<String, int>.from(_obtainedTricks);
-      if (onRoundCompleted != null) {
-        onRoundCompleted!(announcements, obtained);
-      }
+      onRoundCompleted?.call(announcements, obtained);
+      return;
     }
-    
-    if (!allCardsPlayed) {
-      _currentPlayerTurn = winnerName;
+
+    if (completedTrick < 13) {
+      _currentTrickNumber = completedTrick + 1;
     }
+    advanceToNextPlayerWithCards(preferredStart: winnerName);
   }
 
   // Réinitialise explicitement les compteurs d'une nouvelle manche (0/0)
@@ -820,6 +816,7 @@ class LocalCardManager {
     _currentRoundAnnouncements.clear();
     _isAnnouncementPhase = true;
     _currentTrickNumber = 0;
+    _isRoundEnding = false;
     _currentTrick.clear();
     _obtainedTricks.clear();
     for (final name in _distributedCards.keys) {
@@ -906,6 +903,8 @@ class LocalCardManager {
   set isAnnouncementPhase(bool phase) => _isAnnouncementPhase = phase;
   
   int get currentTrickNumber => _currentTrickNumber;
+
+  bool get isRoundEnding => _isRoundEnding;
 
   void setCurrentTrickNumber(int value) {
     if (value < 0) {

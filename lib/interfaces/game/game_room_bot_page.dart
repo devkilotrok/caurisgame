@@ -580,7 +580,7 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
           final bytes = utf8.encode(payload);
           final hash = crypto.sha256.convert(bytes).toString();
           final roomId = gameSession.roomId ?? '';
-          final roundNumber = gameSession.currentRound + 1;
+          final roundNumber = gameSession.currentRound;
           if (roomId.isNotEmpty) {
             try {
               await GameApiService.instance.distributeCards(
@@ -600,15 +600,19 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
 
         cardManager.onRoundCompleted = (announcements, obtained) async {
           final roomId = gameSession.roomId ?? '';
-          if (roomId.isEmpty) return;
-          try {
-            await GameApiService.instance.saveRound(
-              roomId: roomId,
-              roundNumber: gameSession.currentRound + 1,
-              announcements: announcements,
-              obtainedTricks: obtained,
-            );
-          } catch (_) {}
+          if (roomId.isNotEmpty) {
+            try {
+              await GameApiService.instance.saveRound(
+                roomId: roomId,
+                roundNumber: gameSession.currentRound,
+                announcements: announcements,
+                obtainedTricks: obtained,
+              );
+            } catch (_) {}
+          }
+          if (mounted) {
+            tryCompleteRoundIfFinished();
+          }
         };
 
         setState(() {});
@@ -1833,7 +1837,7 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
     final announcements = cardManager.getCurrentRoundAnnouncements();
     final playerAnnouncement = announcements.firstWhere(
       (ann) => ann['player'] == widget.currentPlayerName,
-      orElse: () => <String, Object>{'announcement': 0},
+      orElse: () => <String, dynamic>{'announcement': 0},
     );
     return playerAnnouncement['announcement'] as int;
   }
@@ -1890,22 +1894,18 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
             });
             // ✅ Après l'animation, vider le trick et passer au suivant
             Future.delayed(const Duration(milliseconds: 1200), () {
-              if (!mounted) return;
-              // ✅ Vider le trick dans GameLogic ET dans cardManager
-              gameLogic.nextTrick();
-              cardManager.clearCurrentTrick(); // ✅ Vider le trick du cardManager pour retirer les cartes du centre
-              cardManager.currentPlayerTurn = winner; // Le gagnant commence
-              if (mounted) {
-                setState(() {
-                  isCollectingTrick = false;
-                  lastTrickWinner = null;
-                });
+              if (!mounted || !shouldAllowAutoPlay()) {
+                if (mounted &&
+                    (cardManager.isRoundEnding || cardManager.allCardsPlayed())) {
+                  tryCompleteRoundIfFinished();
+                }
+                return;
               }
-              maybeAutoPlayCurrentBot();
+              _resumePlayAfterTrick(winner);
             });
           } else {
             if (mounted) setState(() {});
-            maybeAutoPlayCurrentBot();
+            scheduleMaybeAutoPlayCurrentBot();
           }
         } else {
           print('❌ Échec du jeu de carte pour ${widget.currentPlayerName}: ${result['error']}');
@@ -1955,6 +1955,23 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
     });
   }
 
+  void _resumePlayAfterTrick(String winner) {
+    gameLogic.nextTrick();
+    cardManager.clearCurrentTrick();
+    if (cardManager.isRoundEnding || cardManager.allCardsPlayed()) {
+      tryCompleteRoundIfFinished();
+      return;
+    }
+    cardManager.advanceToNextPlayerWithCards(preferredStart: winner);
+    if (mounted) {
+      setState(() {
+        isCollectingTrick = false;
+        lastTrickWinner = null;
+      });
+    }
+    scheduleMaybeAutoPlayCurrentBot();
+  }
+
   @override
   void maybeAutoPlayCurrentBot() {
     if (!mounted || cardManager.isAnnouncementPhase) {
@@ -1962,30 +1979,18 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
       return;
     }
 
-    // ✅ Vérifier qu'aucun joueur n'est déjà en train de jouer
-    if (currentPlayerPlaying != null) {
-      print('⚠️ maybeAutoPlayCurrentBot: $currentPlayerPlaying est déjà en train de jouer - ignoré');
+    if (cardManager.isRoundEnding || cardManager.allCardsPlayed()) {
+      tryCompleteRoundIfFinished();
       return;
     }
 
-    // ✅ Vérifier si toutes les cartes ont été jouées (fin de manche)
-    // Une manche = exactement 13 tricks (4 joueurs × 13 cartes = 52 cartes)
-    // On vérifie que TOUTES les cartes sont jouées, pas juste le nombre de tricks
-    bool allCardsPlayed = true;
-    final players = gameSession.players
-        .map((p) => p['name'] as String? ?? 'Joueur')
-        .toList();
-    for (final playerName in players) {
-      final playerCards = cardManager.getPlayerCards(playerName);
-      if (playerCards.isNotEmpty) {
-        allCardsPlayed = false;
-        break;
-      }
+    if (isProcessingRoundCompletion) {
+      return;
     }
-    
-    if (allCardsPlayed) {
-      print('🎉 TOUTES LES CARTES ONT ÉTÉ JOUÉES ! Manche terminée.');
-      onRoundCompleted();
+
+    // ✅ Vérifier qu'aucun joueur n'est déjà en train de jouer
+    if (currentPlayerPlaying != null) {
+      print('⚠️ maybeAutoPlayCurrentBot: $currentPlayerPlaying est déjà en train de jouer - ignoré');
       return;
     }
 
@@ -2007,7 +2012,13 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
 
     final botCards = cardManager.getPlayerCards(current);
     if (botCards.isEmpty) {
-      print('⚠️ maybeAutoPlayCurrentBot: $current n\'a plus de cartes');
+      print('⏭️ maybeAutoPlayCurrentBot: $current n\'a plus de cartes — joueur suivant');
+      final advanced = cardManager.advanceToNextPlayerWithCards();
+      if (advanced && shouldAllowAutoPlay()) {
+        maybeAutoPlayCurrentBot();
+      } else if (!advanced) {
+        tryCompleteRoundIfFinished();
+      }
       return;
     }
 
@@ -2070,29 +2081,27 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
             });
             // ✅ Après l'animation, vider le trick et passer au suivant
             Future.delayed(const Duration(milliseconds: 1200), () {
-              if (!mounted) return;
-              // ✅ Vider le trick dans GameLogic ET dans cardManager
-              gameLogic.nextTrick();
-              cardManager.clearCurrentTrick(); // ✅ Vider le trick du cardManager pour retirer les cartes du centre
-              cardManager.currentPlayerTurn = winner; // Le gagnant commence
-              if (mounted) {
-                setState(() {
-                  isCollectingTrick = false;
-                  lastTrickWinner = null;
-                });
+              if (!mounted || !shouldAllowAutoPlay()) {
+                if (mounted &&
+                    (cardManager.isRoundEnding || cardManager.allCardsPlayed())) {
+                  tryCompleteRoundIfFinished();
+                }
+                return;
               }
-              maybeAutoPlayCurrentBot();
+              _resumePlayAfterTrick(winner);
             });
           } else {
               if (mounted) setState(() {});
-              maybeAutoPlayCurrentBot();
+              scheduleMaybeAutoPlayCurrentBot();
             }
           } else {
             print('❌ Échec du jeu de carte pour $current: ${res['error']}');
             currentPlayerPlaying = null;
             // ✅ Réessayer après un court délai si le jeu a échoué
             Future.delayed(const Duration(milliseconds: 500), () {
-              if (mounted && cardManager.currentPlayerTurn == current) {
+              if (mounted &&
+                  cardManager.currentPlayerTurn == current &&
+                  shouldAllowAutoPlay()) {
                 maybeAutoPlayCurrentBot();
               }
             });
@@ -2101,9 +2110,10 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
           print('❌ Erreur lors du jeu de carte pour $current: $e');
           print('Stack trace: $stackTrace');
           currentPlayerPlaying = null;
-          // ✅ Réessayer après un court délai en cas d'erreur
           Future.delayed(const Duration(milliseconds: 500), () {
-            if (mounted && cardManager.currentPlayerTurn == current) {
+            if (mounted &&
+                cardManager.currentPlayerTurn == current &&
+                shouldAllowAutoPlay()) {
               maybeAutoPlayCurrentBot();
             }
           });
@@ -2351,6 +2361,7 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
       });
     } catch (e) {
       print('❌ Erreur calcul score: $e');
+      isProcessingRoundCompletion = false;
     }
   }
 
@@ -2366,12 +2377,13 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
         return;
       }
 
-      // Préparer le numéro de manche suivant (round 1 → 2, etc.)
-      final roundNumber = gameSession.currentRound + 1;
-      gameSession.currentRound = roundNumber;
+      // Passer à la manche suivante (1 → 2 → 3…)
+      gameSession.currentRound++;
+      final roundNumber = gameSession.currentRound;
 
       isProcessingAnnouncementCompletion = false;
       isProcessingAnnouncementTurn = false;
+      isProcessingRoundCompletion = false;
       cardManager.resetRoundCounters();
       cardManager.clearCurrentTrick();
       cardManager.isAnnouncementPhase = true;
@@ -2441,7 +2453,7 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
       String firstPlayer = playerNames.first;
       final creator = gameSession.players.firstWhere(
         (p) => (p['isCreator'] as bool?) == true,
-        orElse: () => <String, Object>{},
+        orElse: () => <String, dynamic>{},
       );
       if ((creator['name'] as String?) != null) {
         firstPlayer = creator['name'] as String;
@@ -2669,7 +2681,7 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
         String firstPlayer = playerNames.first;
         final creator = gameSession.players.firstWhere(
           (p) => (p['isCreator'] as bool?) == true,
-          orElse: () => <String, Object>{},
+          orElse: () => <String, dynamic>{},
         );
         if ((creator['name'] as String?) != null) {
           firstPlayer = creator['name'] as String;
@@ -3388,7 +3400,7 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
         final announcements = cardManager.getCurrentRoundAnnouncements();
         final playerAnnouncement = announcements.firstWhere(
           (ann) => (ann['player'] as String?) == playerName,
-          orElse: () => <String, Object>{},
+          orElse: () => <String, dynamic>{},
         );
         if ((playerAnnouncement['announcement'] as int?) != null) {
           playerAnnouncement['player'] = botName;

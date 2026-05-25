@@ -120,6 +120,38 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
   @protected
   set isProcessingAnnouncementCompletion(bool value);
 
+  bool _isProcessingRoundCompletion = false;
+
+  @protected
+  bool get isProcessingRoundCompletion => _isProcessingRoundCompletion;
+
+  @protected
+  set isProcessingRoundCompletion(bool value) =>
+      _isProcessingRoundCompletion = value;
+
+  /// Bloque l'auto-play quand la manche est finie ou en cours de finalisation.
+  @protected
+  bool shouldAllowAutoPlay() {
+    return mounted &&
+        !cardManager.isAnnouncementPhase &&
+        !cardManager.isRoundEnding &&
+        !cardManager.allCardsPlayed() &&
+        !isProcessingRoundCompletion;
+  }
+
+  @protected
+  void scheduleMaybeAutoPlayCurrentBot() {
+    if (!shouldAllowAutoPlay()) return;
+    maybeAutoPlayCurrentBot();
+  }
+
+  @protected
+  void tryCompleteRoundIfFinished() {
+    if (isProcessingRoundCompletion) return;
+    if (!cardManager.allCardsPlayed() && !cardManager.isRoundEnding) return;
+    onRoundCompleted();
+  }
+
   @protected
   String? get currentPlayerPlaying;
   @protected
@@ -1351,7 +1383,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
           // ✅ Vérifier que le tour n'a pas changé entre-temps
           if (currentPlayerPlaying == null) {
             print('🔄 Backup: Appel de maybeAutoPlayCurrentBot() après délai (si turn_changed n\'a pas fonctionné)');
-            maybeAutoPlayCurrentBot();
+            scheduleMaybeAutoPlayCurrentBot();
           } else {
             print('🔄 Backup: maybeAutoPlayCurrentBot() ignoré car $currentPlayerPlaying est déjà en train de jouer');
           }
@@ -1431,7 +1463,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
             if (cardManager.currentPlayerTurn == effectivePlayerName && 
                 currentPlayerPlaying == null &&
                 !cardManager.isAnnouncementPhase) {
-              maybeAutoPlayCurrentBot();
+              scheduleMaybeAutoPlayCurrentBot();
             }
           });
         }
@@ -1737,6 +1769,15 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       print('⚠️ maybeAutoPlayCurrentBot appelé pendant la phase d\'annonces - ignoré');
       return;
     }
+
+    if (cardManager.isRoundEnding || cardManager.allCardsPlayed()) {
+      tryCompleteRoundIfFinished();
+      return;
+    }
+
+    if (isProcessingRoundCompletion) {
+      return;
+    }
     
     // ✅ Vérifier qu'aucun joueur n'est déjà en train de jouer
     if (currentPlayerPlaying != null) {
@@ -1745,16 +1786,6 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     }
     
     print('🔍 maybeAutoPlayCurrentBot: Vérification du joueur actuel...');
-
-    // ✅ OPTIMISATION: Vérifier si c'est le dernier trick (fin de manche)
-    // Une manche = exactement 13 tricks (4 joueurs × 13 cartes = 52 cartes)
-    // Si currentTrickNumber > 13, c'est la fin de la manche (le 13ème trick est terminé)
-    final currentTrickNum = cardManager.currentTrickNumber;
-    if (currentTrickNum > 13) {
-      print('🎉 Dernier trick terminé ! Manche terminée (trick=$currentTrickNum).');
-      onRoundCompleted();
-      return;
-    }
 
     final current = cardManager.currentPlayerTurn;
     if (current.isEmpty) return;
@@ -1798,11 +1829,15 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       print('🤖 Mode bot: bot $current joue automatiquement');
     }
 
-    // Vérifier s'il reste des cartes à jouer pour ce joueur
     final botCards = cardManager.getPlayerCards(current);
     if (botCards.isEmpty) {
-      print('✅ $current a terminé ses cartes, on passe au suivant');
-      // Le _finishTrick va gérer le passage au joueur suivant
+      print('⏭️ $current n\'a plus de cartes — passage au joueur suivant');
+      final advanced = cardManager.advanceToNextPlayerWithCards();
+      if (advanced && shouldAllowAutoPlay()) {
+        maybeAutoPlayCurrentBot();
+      } else if (!advanced) {
+        tryCompleteRoundIfFinished();
+      }
       return;
     }
 
@@ -2207,6 +2242,8 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
   // Calcul et affichage du tableau de score à la fin de la manche
   // ✅ Méthode protégée accessible depuis les sous-classes
   Future<void> onRoundCompleted() async {
+    if (isProcessingRoundCompletion) return;
+    isProcessingRoundCompletion = true;
     try {
       final players = gameSession.players
           .map((p) => p['name'] as String? ?? 'Joueur')
@@ -2833,33 +2870,14 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
             // ✅ Utiliser startGamePhase() pour initialiser correctement currentTrickNumber à 1
             cardManager.startGamePhase();
             
-            // ✅ CORRECTION: Dans le cas des annonces augmentées, on crée un nouveau round
-            // donc on utilise currentRound + 1 (c'est différent du cas normal)
-            final nextRoundNum = gameSession.currentRound + 1;
-            final alreadyAdded = gameSession.roundsData.any(
-              (r) => (r['roundNumber'] as int) == nextRoundNum
-            );
-            
-            if (!alreadyAdded) {
-              final players = gameSession.players
-                  .map((p) => p['name'] as String? ?? 'Joueur')
-                  .toList();
-              final anns = players.map((name) {
-                final a = updatedAnnouncements.firstWhere(
-                  (e) => e['player'] == name,
-                  orElse: () => <String, Object>{'announcement': 0},
-                );
-                return a['announcement'] as int? ?? 0;
-              }).toList();
-              gameSession.addRound(anns); // ✅ Ici on utilise addRound() car c'est un nouveau round
-              print('✅ Round $nextRoundNum ajouté (total < 10, annonces augmentées)');
-            }
-            
+            // Enregistrer le round actuel (R1 au premier coup, pas R2)
+            _registerCurrentRoundInScoreboard();
+            final currentRoundNum = gameSession.currentRound;
+
             // Choisir le premier joueur de la phase de jeu selon la rotation par round
-            // Utiliser le numéro de round qui vient d'être ajouté
-            final starting = getStartingPlayerForRoundPlay(nextRoundNum);
+            final starting = getStartingPlayerForRoundPlay(currentRoundNum);
             cardManager.currentPlayerTurn = starting;
-            print('🎯 Premier joueur pour la phase de jeu (Round $nextRoundNum): $starting');
+            print('🎯 Premier joueur pour la phase de jeu (Round $currentRoundNum): $starting');
 
             print('✅ Phase de jeu configurée - Premier joueur: $starting');
 
@@ -2875,7 +2893,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
             // ✅ Démarrer le moteur de jeu automatique pour les bots avec un petit délai supplémentaire
             Future.delayed(const Duration(milliseconds: 500), () {
               if (mounted && !cardManager.isAnnouncementPhase) {
-                maybeAutoPlayCurrentBot();
+                scheduleMaybeAutoPlayCurrentBot();
               }
             });
           });
@@ -3248,6 +3266,30 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     });
   }
   
+  /// Enregistre le round en cours dans [roundsData] (R1, R2, …) sans incrémenter [currentRound].
+  void _registerCurrentRoundInScoreboard() {
+    if (gameSession.currentRound < 1) {
+      gameSession.currentRound = 1;
+    }
+    final roundNum = gameSession.currentRound;
+    if (gameSession.roundsData.any((r) => (r['roundNumber'] as int) == roundNum)) {
+      return;
+    }
+    final players = gameSession.players
+        .map((p) => p['name'] as String? ?? 'Joueur')
+        .toList();
+    final announcements = cardManager.getCurrentRoundAnnouncements();
+    final anns = players.map((name) {
+      final a = announcements.firstWhere(
+        (e) => e['player'] == name,
+        orElse: () => <String, dynamic>{'announcement': 0},
+      );
+      return (a['announcement'] as num?)?.toInt() ?? 0;
+    }).toList();
+    gameSession.addCurrentRound(anns);
+    print('✅ Round $roundNum enregistré dans roundsData (annonces: $anns)');
+  }
+
   // ✅ Méthode helper pour démarrer la phase de jeu après les annonces
   void _startGamePhaseAfterAnnouncements() {
     try {
@@ -3270,11 +3312,9 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       );
       
       if (!alreadyAdded) {
-        // ⚠️ Ce cas ne devrait JAMAIS arriver car le round est toujours ajouté dans announcements_complete
-        // Mais si cela arrive, on log juste un avertissement sans ajouter le round pour éviter les doublons
-        print('⚠️ ATTENTION: Round $currentRoundNum non trouvé dans roundsData');
-        print('   Le round devrait avoir été ajouté dans announcements_complete');
-        print('   On ne l\'ajoute PAS ici pour éviter les doublons');
+        // Mode bot / fallback : enregistrer R1, R2… avant la phase de jeu
+        print('⚠️ Round $currentRoundNum absent de roundsData — enregistrement (mode bot ou fallback)');
+        _registerCurrentRoundInScoreboard();
       } else {
         print('✅ Round $currentRoundNum confirmé dans roundsData (ajouté dans announcements_complete) - pas de duplication');
       }
@@ -3297,7 +3337,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
         // ✅ Démarrer le moteur de jeu automatique pour les bots avec un petit délai supplémentaire
         Future.delayed(const Duration(milliseconds: 500), () {
           if (mounted && !cardManager.isAnnouncementPhase) {
-            maybeAutoPlayCurrentBot();
+            scheduleMaybeAutoPlayCurrentBot();
           }
         });
       });

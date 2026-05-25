@@ -1073,15 +1073,19 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     cardManager.onRoundCompleted = (announcements, obtained) async {
       final roomId = gameSession.roomId ?? '';
-      if (roomId.isEmpty) return;
-      try {
-        await GameApiService.instance.saveRound(
-          roomId: roomId,
-          roundNumber: gameSession.currentRound + 1,
-          announcements: announcements,
-          obtainedTricks: obtained,
-        );
-      } catch (_) {}
+      if (roomId.isNotEmpty) {
+        try {
+          await GameApiService.instance.saveRound(
+            roomId: roomId,
+            roundNumber: gameSession.currentRound,
+            announcements: announcements,
+            obtainedTricks: obtained,
+          );
+        } catch (_) {}
+      }
+      if (mounted) {
+        tryCompleteRoundIfFinished();
+      }
     };
 
     // ✅ Le backend garantit désormais qu'au moins un pique est présent pour chaque joueur.
@@ -2220,25 +2224,23 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         print('✅ UI mise à jour: animation terminée, trick nettoyé');
       }
 
-      // 4. Passer au joueur suivant si c'est un bot
-      // ✅ OPTIMISATION: Vérifier si c'est le dernier trick (fin de manche)
-      // Une manche = exactement 13 tricks (4 joueurs × 13 cartes = 52 cartes)
-      // Si currentTrickNumber > 13, c'est la fin de la manche
-      final currentTrickNum = cardManager.currentTrickNumber;
-      if (currentTrickNum > 13) {
-        print('🎉 Dernier trick terminé ! Manche terminée (détecté dans _handleTrickEnd, trick=$currentTrickNum).');
-        // Appeler onRoundCompleted() directement (qui est dans la classe de base)
-        Future.delayed(const Duration(milliseconds: 500), () {
-          if (mounted && !cardManager.isAnnouncementPhase) {
-            onRoundCompleted();
-          }
-        });
-        return; // Ne pas continuer avec maybeAutoPlayCurrentBot si la manche est terminée
+      if (cardManager.isRoundEnding || cardManager.allCardsPlayed()) {
+        cardManager.advanceToNextPlayerWithCards(preferredStart: winnerName);
+        tryCompleteRoundIfFinished();
+        return;
       }
-      
+
+      cardManager.advanceToNextPlayerWithCards(preferredStart: winnerName);
+
       // ✅ Augmenter le délai pour laisser le temps au backend de créer le nouveau trick
       Future.delayed(const Duration(milliseconds: 1500), () async {
-        if (!mounted) return;
+        if (!mounted || !shouldAllowAutoPlay()) {
+          if (mounted &&
+              (cardManager.isRoundEnding || cardManager.allCardsPlayed())) {
+            tryCompleteRoundIfFinished();
+          }
+          return;
+        }
         final current = cardManager.currentPlayerTurn;
         if (current.isNotEmpty && current != widget.currentPlayerName) {
           print('🔄 Appel maybeAutoPlayCurrentBot après nettoyage trick (délai 1.5s)');
@@ -2261,42 +2263,38 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
               
               if (trickData['success'] == true) {
                 print('✅ Nouveau trick prêt, le bot peut jouer');
-                maybeAutoPlayCurrentBot();
+                scheduleMaybeAutoPlayCurrentBot();
               } else {
                 // ✅ Erreur 409 - le trick n'est pas encore prêt, attendre plus longtemps
                 final errorMessage = trickData['message']?.toString() ?? '';
                 if (errorMessage.contains('Trick not ready yet') || errorMessage.contains('409')) {
                   print('⏳ Trick pas encore prêt (409), attente de 1.5s avant nouvelle tentative...');
                   Future.delayed(const Duration(milliseconds: 1500), () {
-                    if (mounted) maybeAutoPlayCurrentBot();
+                    if (mounted) scheduleMaybeAutoPlayCurrentBot();
                   });
                 } else {
                   print('⚠️ Erreur lors de la vérification du trick: $errorMessage');
-                  // Pour les autres erreurs, attendre un peu moins
                   Future.delayed(const Duration(milliseconds: 500), () {
-                    if (mounted) maybeAutoPlayCurrentBot();
+                    if (mounted) scheduleMaybeAutoPlayCurrentBot();
                   });
                 }
               }
           } else {
-            // Si roomId n'est pas disponible, attendre un peu plus et essayer quand même
             Future.delayed(const Duration(milliseconds: 500), () {
-              if (mounted) maybeAutoPlayCurrentBot();
+              if (mounted) scheduleMaybeAutoPlayCurrentBot();
             });
           }
         } catch (e) {
           print('⚠️ Erreur lors de la vérification du trick: $e');
           final errorString = e.toString();
-          // ✅ Si c'est une erreur 409, attendre plus longtemps
           if (errorString.contains('Trick not ready yet') || errorString.contains('409')) {
             print('⏳ Trick pas encore prêt (exception 409), attente de 1.5s...');
             Future.delayed(const Duration(milliseconds: 1500), () {
-              if (mounted) maybeAutoPlayCurrentBot();
+              if (mounted) scheduleMaybeAutoPlayCurrentBot();
             });
           } else {
-            // Pour les autres erreurs, attendre un peu moins
             Future.delayed(const Duration(milliseconds: 500), () {
-              if (mounted) maybeAutoPlayCurrentBot();
+              if (mounted) scheduleMaybeAutoPlayCurrentBot();
             });
           }
         }
@@ -5575,6 +5573,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         print('👑 Créateur: demande de redistribution des cartes au backend...');
         
         // Réinitialiser l'état d'annonces/pli
+        isProcessingRoundCompletion = false;
         cardManager.resetRoundCounters();
         cardManager.clearCurrentTrick();
         
