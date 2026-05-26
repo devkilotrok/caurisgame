@@ -106,6 +106,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
   Future<int?> _resolveGameId() async {
     if (_currentGameId != null) return _currentGameId;
+    await _pullDistributionFromSync();
+    if (_currentGameId != null) return _currentGameId;
     try {
       final id = await getGameId();
       if (id != null) {
@@ -115,6 +117,26 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     } catch (e) {
       print('⚠️ Impossible de résoudre gameId: $e');
       return null;
+    }
+  }
+
+  /// Récupère cartes + game_id via GET /rooms/{id}/sync (joueurs non-créateurs, WS coupé).
+  Future<void> _pullDistributionFromSync() async {
+    if (!mounted || gameSession.playWithBots) return;
+    final roomId = gameSession.roomId ?? '';
+    if (roomId.isEmpty) return;
+
+    try {
+      final res = await GameApiService.instance.syncRoom(
+        roomId: roomId,
+        lastChatId: _lastChatMessageId,
+      );
+      final data = Map<String, dynamic>.from(
+        (res['data'] as Map?) ?? res as Map,
+      );
+      _applyRoomSyncPayload(data);
+    } catch (e) {
+      print('⚠️ sync distribution: $e');
     }
   }
   StreamSubscription? _cardDistributionSubscription;
@@ -598,7 +620,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   }
 
   @override
-  @override
   Future<void> startCardDistribution() async {
     try {
       final playerNames = gameSession.players
@@ -1018,11 +1039,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           }
         }
       } else {
-        // ✅ LES AUTRES JOUEURS attendent la distribution
-        print('⏳ En attente de la distribution des cartes...');
-        
-        // Listener déjà configuré dans _initializeWebSocketListeners
-        // La distribution sera appliquée quand l'événement arrive
+        print('⏳ En attente de la distribution des cartes (sync HTTP)...');
+        await _pullDistributionFromSync();
+        _restartRoomSyncPolling(forceRestart: true);
       }
     } catch (e) {
       print('❌ Erreur distribution: $e');
@@ -1065,6 +1084,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   void _applyCardDistributionPayload(
     Map<String, dynamic> distribution, {
     int? roundNumber,
+    bool skipConfigureIfAnnouncementActive = false,
   }) {
     _syncRoundNumber(roundNumber);
 
@@ -1072,7 +1092,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     cardManager.clearCurrentTrick();
 
     for (final entry in distribution.entries) {
-      final playerName = entry.key;
+      final playerName = entry.key.toString();
       final cardCodes = (entry.value as List).cast<String>();
       final cards = cardCodes.map((code) {
         return LocalCardManager.instance.getCardByCode(code) ?? {
@@ -1092,6 +1112,11 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       setState(() {
         hasGameStarted = true;
       });
+    }
+
+    if (skipConfigureIfAnnouncementActive && cardManager.isAnnouncementPhase) {
+      print('ℹ️ Cartes appliquées — phase d\'annonces déjà active');
+      return;
     }
 
     _configureGameAfterDistribution(playerNames);
@@ -3095,11 +3120,16 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     roomPollTimer = null;
     stateSyncTimer?.cancel();
 
-    final interval = GameRoomPollingPolicy.roomSyncInterval(
-      webSocketConnected: isWebSocketConnected,
-      waitingForPlayers: waitingForHumans,
-      announcementPhase: cardManager.isAnnouncementPhase,
-    );
+    final myCardsMissing =
+        cardManager.getPlayerCards(widget.currentPlayerName).isEmpty;
+
+    final interval = myCardsMissing && !waitingForHumans
+        ? const Duration(seconds: 3)
+        : GameRoomPollingPolicy.roomSyncInterval(
+            webSocketConnected: isWebSocketConnected,
+            waitingForPlayers: waitingForHumans,
+            announcementPhase: cardManager.isAnnouncementPhase,
+          );
 
     stateSyncTimer = Timer.periodic(interval, (_) => _pollGameState());
   }
@@ -3112,10 +3142,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   Future<void> _pollGameState() async {
     if (!mounted || gameSession.playWithBots) return;
 
-    if (GameRoomPollingPolicy.shouldSkipRoomSync(
-      webSocketConnected: isWebSocketConnected,
-      announcementPhase: cardManager.isAnnouncementPhase,
-    )) {
+    final myCardsMissing =
+        cardManager.getPlayerCards(widget.currentPlayerName).isEmpty;
+
+    if (!myCardsMissing &&
+        GameRoomPollingPolicy.shouldSkipRoomSync(
+          webSocketConnected: isWebSocketConnected,
+          announcementPhase: cardManager.isAnnouncementPhase,
+        )) {
       return;
     }
 
@@ -3172,6 +3206,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     final round = data['round'] as Map<String, dynamic>?;
     if (round != null) {
+      _applyDistributionFromSyncRound(round);
+
       final status = round['status'] as String?;
       if (status == 'ANNOUNCEMENT_PHASE' && !cardManager.isAnnouncementPhase) {
         final startTs =
@@ -3206,6 +3242,29 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       }
       if (mounted) setState(() {});
     }
+  }
+
+  void _applyDistributionFromSyncRound(Map<String, dynamic> round) {
+    final raw = round['distributed_cards'];
+    if (raw is! Map || raw.isEmpty) return;
+
+    if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
+      return;
+    }
+
+    final distribution = Map<String, dynamic>.from(raw);
+    final roundNumber = (round['round_number'] as num?)?.toInt();
+
+    print(
+      '📥 Cartes récupérées via /sync pour ${widget.currentPlayerName} '
+      '(round $roundNumber, ${distribution.length} joueurs)',
+    );
+
+    _applyCardDistributionPayload(
+      distribution,
+      roundNumber: roundNumber,
+      skipConfigureIfAnnouncementActive: cardManager.isAnnouncementPhase,
+    );
   }
 
   void _ingestChatFromSync(Map<String, dynamic> chat) {
@@ -5375,17 +5434,20 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           });
         }
       }
-      
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text('Erreur lors de l\'envoi de l\'annonce. L\'annonce sera assignée automatiquement si nécessaire.'),
-          duration: const Duration(seconds: 3),
-          backgroundColor: Colors.orange,
-          behavior: SnackBarBehavior.floating,
-          margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        ),
-      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Annonce enregistrée localement. Synchronisation serveur en cours…',
+            ),
+            duration: Duration(seconds: 2),
+            backgroundColor: Colors.orange,
+            behavior: SnackBarBehavior.floating,
+            margin: EdgeInsets.only(bottom: 100, left: 20, right: 20),
+          ),
+        );
+      }
     }
   }
 
