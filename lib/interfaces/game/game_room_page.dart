@@ -1187,7 +1187,9 @@ class _GameRoomPageState extends State<GameRoomPage>
             lastChatId: _lastChatMessageId,
           )
           .timeout(const Duration(seconds: 5));
-      final data = (res['data'] as Map?) ?? res;
+      final data = Map<String, dynamic>.from(
+        (res['data'] as Map?) ?? res as Map,
+      );
       final players =
           (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
       if (players.isNotEmpty) {
