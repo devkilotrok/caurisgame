@@ -7,6 +7,15 @@ class GameApiService {
   GameApiService._();
   static final GameApiService instance = GameApiService._();
 
+  static Map<String, String> _jsonHeaders() {
+    final token = UserService.instance.authToken;
+    return {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      if (token != null) 'Authorization': 'Bearer $token',
+    };
+  }
+
   Future<Map<String, dynamic>> createRoom({
     required String roomName,
     required int minimumBet,
@@ -290,19 +299,35 @@ class GameApiService {
   Future<Map<String, dynamic>> getRoom({
     required String roomId,
   }) async {
-    final token = UserService.instance.authToken;
     final uri = Uri.parse(ApiConfig.endpoint('rooms/$roomId'));
     final res = await http.get(
       uri,
-      headers: {
-        'Content-Type': 'application/json',
-        if (token != null) 'Authorization': 'Bearer $token',
-      },
+      headers: _jsonHeaders(),
     );
     if (res.statusCode >= 200 && res.statusCode < 300) {
       return jsonDecode(res.body) as Map<String, dynamic>;
     }
     throw Exception('Erreur getRoom: ${res.statusCode} ${res.body}');
+  }
+
+  /// État consolidé : joueurs + game_id + manche + annonces + compteurs de plis.
+  Future<Map<String, dynamic>> syncRoom({
+    required String roomId,
+    int? lastChatId,
+  }) async {
+    final uri = Uri.parse(ApiConfig.endpoint('rooms/$roomId/sync')).replace(
+      queryParameters: {
+        if (lastChatId != null) 'last_chat_id': lastChatId.toString(),
+      },
+    );
+    final res = await http.get(
+      uri,
+      headers: _jsonHeaders(),
+    );
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      return jsonDecode(res.body) as Map<String, dynamic>;
+    }
+    throw Exception('Erreur syncRoom: ${res.statusCode} ${res.body}');
   }
 
   /// Récupérer la liste des salles disponibles

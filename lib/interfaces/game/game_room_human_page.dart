@@ -6,11 +6,11 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart' as crypto;
 import '../../services/api/game_api_service.dart';
-import '../../services/api/room_chat_api_service.dart';
 import '../../services/user/user_service.dart';
 import '../../models/game/local_card_manager.dart';
 import '../../services/websocket/game_websocket_service.dart';
 import 'game_room_base_page.dart';
+import 'game_room_polling_policy.dart';
 
 /// Page de jeu pour le MODE HUMAIN uniquement
 class GameRoomHumanPage extends GameRoomBasePage {
@@ -467,12 +467,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     _initializeWebSocketListeners();
 
-    // ✅ AJOUTER ICI: Synchronisation périodique des compteurs
-    _startCountersSyncPolling();
-
     if (!gameSession.playWithBots && requiredPlayers > 0) {
       waitingForHumans = true;
-      _startRoomPolling();
+      _restartRoomSyncPolling(forceRestart: true);
     }
   }
 
@@ -521,11 +518,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       return;
     }
 
+    // Chat : WebSocket en temps réel + messages inclus dans syncRoom (pas de timer dédié).
     chatPollingTimer?.cancel();
-    _fetchChatMessagesFromApi();
-    // ✅ Réduire la fréquence du polling (10 secondes au lieu de 4) car WebSocket gère déjà les messages en temps réel
-    chatPollingTimer =
-        Timer.periodic(const Duration(seconds: 10), (_) => _fetchChatMessagesFromApi());
   }
 
   @override
@@ -1240,7 +1234,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
         });
       }
-      _startStateSyncPolling(forceRestart: true);
+      _countersSyncTimer?.cancel();
+      _restartRoomSyncPolling(forceRestart: true);
     });
 
     wsDisconnectSubscription = wsService.onDisconnect().listen((_) {
@@ -1248,7 +1243,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       setState(() {
         isWebSocketConnected = false;
       });
-      _startStateSyncPolling(forceRestart: true);
+      _restartRoomSyncPolling(forceRestart: true);
     });
 
     wsErrorSubscription = wsService.onError().listen((error) {
@@ -1256,7 +1251,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       setState(() {
         isWebSocketConnected = false;
       });
-      _startStateSyncPolling(forceRestart: true);
+      _restartRoomSyncPolling(forceRestart: true);
     });
 
     // ✅ NOUVEAU: Écouter la distribution de cartes
@@ -1673,7 +1668,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             cardManager.isAnnouncementPhase = true;
           });
         }
-        
+        _restartRoomSyncPolling(forceRestart: true);
+
         // ✅ Faire annoncer automatiquement tous les bots après 10 secondes de la phase
         // ⚠️ Augmenté à 10 secondes pour laisser le temps au cache backend d'être créé
         Future.delayed(const Duration(seconds: 10), () async {
@@ -1899,7 +1895,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         }
         
         super.handleAnnouncementTurnComplete();
-        
+        _restartRoomSyncPolling(forceRestart: true);
+
         // ✅ Après handleAnnouncementTurnComplete(), utiliser le firstPlayer du backend si disponible
         if (backendFirstPlayer != null && backendFirstPlayer.isNotEmpty && mounted) {
           Future.delayed(const Duration(milliseconds: 100), () {
@@ -3008,107 +3005,144 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     });
   }
 
-  void _startRoomPolling() {
-    if (gameSession.playWithBots) return;
-    roomPollTimer?.cancel();
-    roomPollTimer = Timer.periodic(const Duration(seconds: 3), (t) async {
-      try {
-        final roomId = gameSession.roomId ?? '';
-        if (roomId.isEmpty) return;
-        final res = await GameApiService.instance.getRoom(roomId: roomId);
-        final data = (res['data'] as Map?) ?? res;
-        final players = (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-        if (players.isEmpty) return;
-        _applyBackendPlayersState(players, startGameIfReady: true);
-      } catch (e) {
-        print('⚠️ Erreur lors du polling des joueurs: $e');
-      }
-    });
-  }
-
-  /// ✅ Synchronisation périodique des compteurs via API
-  /// En cas de désynchronisation WebSocket, cette méthode resynchronise les compteurs toutes les 5 secondes
-  /// Les compteurs sont TOUJOURS mis à jour automatiquement depuis le backend (source de vérité)
-  void _startCountersSyncPolling() {
-    if (gameSession.playWithBots) return;
-    
-    // ✅ Annuler le timer existant s'il y en a un
-    _countersSyncTimer?.cancel();
-    
-    // ✅ Timer pour synchroniser les compteurs toutes les 5 secondes pendant la phase de jeu
-    _countersSyncTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
-      // ✅ Ne synchroniser que pendant la phase de jeu (pas pendant les annonces)
-      if (!mounted || cardManager.isAnnouncementPhase) return;
-      
-      try {
-        final roomId = gameSession.roomId ?? '';
-        if (roomId.isEmpty) return;
-        
-        // ✅ Récupérer les compteurs depuis le backend (source de vérité)
-        final response = await GameApiService.instance.getCurrentTrickCounters(
-          roomId: roomId,
-        ).timeout(const Duration(seconds: 2));
-        
-        if (response['success'] == true) {
-          final serverCounters = response['obtainedTricks'] as Map<String, dynamic>?;
-          
-          // ⚠️ NOTE: La synchronisation périodique des compteurs est DÉSACTIVÉE
-          // Les compteurs sont mis à jour uniquement lors de trick_completed pour le gagnant
-          // Cela évite les désynchronisations et les écrasements de valeurs locales
-          // La synchronisation périodique peut être réactivée si nécessaire pour la récupération après déconnexion
-          // mais pour l'instant, on fait confiance aux mises à jour incrémentales lors de chaque trick
-          
-          // ✅ Optionnel: Log pour debug (sans mise à jour)
-          if (serverCounters != null && serverCounters.isNotEmpty) {
-            print('📊 RESYNC: Compteurs serveur disponibles mais non synchronisés (gestion incrémentale locale)');
-            for (final entry in serverCounters.entries) {
-              final playerName = entry.key as String;
-              final serverCount = (entry.value as num?)?.toInt() ?? 0;
-              final localCount = cardManager.getObtainedTricks(playerName);
-              if (localCount != serverCount) {
-                print('   - $playerName: local=$localCount, serveur=$serverCount');
-              }
-            }
-          }
-        }
-      } catch (e) {
-        // ⚠️ Ne pas logger les erreurs pour éviter le spam en cas de déconnexion
-        // La synchronisation se fera au prochain intervalle
-      }
-    });
-  }
-
-  void _startStateSyncPolling({bool forceRestart = false}) {
+  /// Un seul timer HTTP pour la salle (remplace room + state sync doublons).
+  void _restartRoomSyncPolling({bool forceRestart = false}) {
     if (gameSession.playWithBots) return;
     if (stateSyncTimer != null && !forceRestart) return;
+
+    roomPollTimer?.cancel();
+    roomPollTimer = null;
     stateSyncTimer?.cancel();
-    final interval = isWebSocketConnected ? GameRoomBaseState.pollIntervalWebSocket : GameRoomBaseState.pollIntervalFallback;
+
+    final interval = GameRoomPollingPolicy.roomSyncInterval(
+      webSocketConnected: isWebSocketConnected,
+      waitingForPlayers: waitingForHumans,
+      announcementPhase: cardManager.isAnnouncementPhase,
+    );
+
     stateSyncTimer = Timer.periodic(interval, (_) => _pollGameState());
   }
 
+  void _startRoomPolling() => _restartRoomSyncPolling(forceRestart: true);
+
+  void _startStateSyncPolling({bool forceRestart = false}) =>
+      _restartRoomSyncPolling(forceRestart: forceRestart);
+
   Future<void> _pollGameState() async {
     if (!mounted || gameSession.playWithBots) return;
+
+    if (GameRoomPollingPolicy.shouldSkipRoomSync(
+      webSocketConnected: isWebSocketConnected,
+      announcementPhase: cardManager.isAnnouncementPhase,
+    )) {
+      return;
+    }
+
     try {
       final roomId = gameSession.roomId ?? '';
       if (roomId.isEmpty) return;
-      
-      final res = await GameApiService.instance.getRoom(roomId: roomId);
+
+      final res = await GameApiService.instance.syncRoom(
+        roomId: roomId,
+        lastChatId: _lastChatMessageId,
+      );
       final data = (res['data'] as Map?) ?? res;
-      final players = (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-      
+      final players =
+          (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+
       if (players.isNotEmpty) {
-        _applyBackendPlayersState(players, startGameIfReady: false);
+        _applyBackendPlayersState(
+          players,
+          startGameIfReady: waitingForHumans,
+        );
       }
-      
+
+      _applyRoomSyncPayload(data);
+
       consecutiveStatePollingErrors = 0;
       lastSuccessfulStatePoll = DateTime.now();
     } catch (e) {
       consecutiveStatePollingErrors++;
       if (consecutiveStatePollingErrors > 5) {
-        print('⚠️ Trop d\'erreurs de polling, arrêt temporaire');
+        print('⚠️ Trop d\'erreurs de polling, pause 30s');
         stateSyncTimer?.cancel();
+        Future.delayed(const Duration(seconds: 30), () {
+          if (mounted) _restartRoomSyncPolling(forceRestart: true);
+        });
       }
     }
+  }
+
+  /// Manche, annonces (hors WS) et chat depuis GET /rooms/{id}/sync.
+  void _applyRoomSyncPayload(Map<String, dynamic> data) {
+    final gameId = data['game_id'];
+    if (gameId is int) {
+      _currentGameId = gameId;
+    } else if (gameId != null) {
+      _currentGameId = int.tryParse(gameId.toString());
+    }
+
+    final chat = data['chat'] as Map<String, dynamic>?;
+    if (chat != null) {
+      _ingestChatFromSync(chat);
+    }
+
+    if (isWebSocketConnected) return;
+
+    final round = data['round'] as Map<String, dynamic>?;
+    if (round == null) return;
+
+    final status = round['status'] as String?;
+    final announcements = round['announcements'] as Map<String, dynamic>?;
+    if (status == 'ANNOUNCEMENT_PHASE' && announcements != null) {
+      for (final entry in announcements.entries) {
+        final playerName = entry.key;
+        final value = (entry.value as num?)?.toInt() ?? 0;
+        final exists = cardManager.getCurrentRoundAnnouncements().any(
+          (ann) => ann['player'] == playerName,
+        );
+        if (!exists && value >= 2) {
+          cardManager.makeAnnouncement(playerName, value);
+        }
+      }
+      if (mounted) setState(() {});
+    }
+  }
+
+  void _ingestChatFromSync(Map<String, dynamic> chat) {
+    if (!mounted || gameSession.playWithBots || _isFetchingChat) return;
+
+    final rawMessages =
+        (chat['messages'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+    if (rawMessages.isEmpty) return;
+
+    final syncLastId = chat['last_chat_id'];
+    if (syncLastId is int) {
+      _lastChatMessageId = _lastChatMessageId == null
+          ? syncLastId
+          : math.max(_lastChatMessageId!, syncLastId);
+    } else if (syncLastId != null) {
+      final parsed = int.tryParse(syncLastId.toString());
+      if (parsed != null) {
+        _lastChatMessageId = _lastChatMessageId == null
+            ? parsed
+            : math.max(_lastChatMessageId!, parsed);
+      }
+    }
+
+    final normalized = rawMessages.map((raw) {
+      final map = Map<String, dynamic>.from(raw);
+      map['id'] = _normalizeMessageId(map['id']) ?? map['id'];
+      map['pseudo'] =
+          (map['pseudo'] ?? map['player_name'] ?? 'Joueur').toString();
+      map['message'] = (map['message'] ?? '').toString();
+      map['message_type'] = (map['message_type'] ?? 'text').toString();
+      map['created_at'] =
+          map['created_at']?.toString() ?? DateTime.now().toIso8601String();
+      return map;
+    }).toList();
+
+    _ingestChatMessages(normalized, enableToast: !isWebSocketConnected);
   }
 
   void _applyBackendPlayersState(List<Map<String, dynamic>> players, {bool startGameIfReady = false}) {
@@ -3199,6 +3233,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     if (startGameIfReady && normalized.length >= requiredPlayers && !hasGameStarted) {
       waitingForHumans = false;
+      _restartRoomSyncPolling(forceRestart: true);
       startCardDistribution();
     }
   }
@@ -3676,15 +3711,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       print('   ❌ RoomId invalide: $roomId');
     }
 
-    // ✅ Attendre un peu avant de fetch pour laisser le serveur traiter le message
-    Future.delayed(const Duration(milliseconds: 500), () {
-      if (mounted) {
-        print('   📥 Fetch des messages depuis l\'API...');
-        _fetchChatMessagesFromApi();
-      }
-    });
-
-    if (mounted) {
+  if (mounted) {
       setState(() {
         isSendingChatMessage = false;
       });
@@ -3827,61 +3854,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       _showChatToast(lastMessage);
     }
     _scrollChatToBottom();
-  }
-
-  Future<void> _fetchChatMessagesFromApi() async {
-    if (!mounted || gameSession.playWithBots || _isFetchingChat) {
-      // ✅ Réduire les logs verbeux pour le polling régulier
-      return;
-    }
-    final roomIdValue = int.tryParse(gameSession.roomId ?? '');
-    if (roomIdValue == null) {
-      return;
-    }
-
-    // ✅ Réduire les logs verbeux pour le polling régulier (seulement logger s'il y a des nouveaux messages)
-    _isFetchingChat = true;
-    try {
-      final response = await RoomChatApiService.instance.fetchMessages(
-        roomId: roomIdValue,
-        lastId: _lastChatMessageId,
-      );
-      if (response['success'] != true) {
-        final message = response['message'];
-        if (message is String && message.isNotEmpty) {
-          print('⚠️ Polling chat: $message');
-        }
-        return;
-      }
-
-      final rawMessages =
-          (response['messages'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-      if (rawMessages.isEmpty) {
-        // ✅ Réduire les logs verbeux pour le polling régulier
-        // print('📥 _fetchChatMessagesFromApi: Aucun nouveau message depuis l\'API');
-        return;
-      }
-
-      // ✅ Logger seulement s'il y a de nouveaux messages
-      print('📥 _fetchChatMessagesFromApi: ${rawMessages.length} nouveau(x) message(s) reçu(s) de l\'API');
-      final normalized = rawMessages.map((raw) {
-        final map = Map<String, dynamic>.from(raw);
-        map['id'] = _normalizeMessageId(map['id']) ?? map['id'];
-        map['pseudo'] =
-            (map['pseudo'] ?? map['player_name'] ?? 'Joueur').toString();
-        map['message'] = (map['message'] ?? '').toString();
-        map['message_type'] = (map['message_type'] ?? 'text').toString();
-        map['created_at'] =
-            map['created_at']?.toString() ?? DateTime.now().toIso8601String();
-        return map;
-      }).toList();
-
-      _ingestChatMessages(normalized);
-    } catch (e) {
-      print('⚠️ Erreur lors du polling du chat: $e');
-    } finally {
-      _isFetchingChat = false;
-    }
   }
 
   // ========== UI BUILDING ==========

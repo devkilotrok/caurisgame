@@ -16,6 +16,7 @@ import '../home/user_menu_page.dart';
 import '../../services/websocket/game_websocket_service.dart';
 import '../../services/api/user_api_service.dart';
 import '../../config/game_constants.dart';
+import 'game_room_polling_policy.dart';
 
 class GameRoomPage extends StatefulWidget {
   final String roomName;
@@ -133,8 +134,6 @@ class _GameRoomPageState extends State<GameRoomPage>
   late AnimationController _chatToastAnimationController;
   Animation<double>? _chatToastAnimation;
 
-  static const Duration _pollIntervalWebSocket = Duration(seconds: 6);
-  static const Duration _pollIntervalFallback = Duration(seconds: 3);
 
   @override
   void initState() {
@@ -175,7 +174,7 @@ class _GameRoomPageState extends State<GameRoomPage>
     // Si partie humains, attendre le nombre requis de joueurs avant de démarrer
     if (!_gameSession.playWithBots && _requiredPlayers > 0) {
       _waitingForHumans = true;
-      _startRoomPolling();
+      _restartRoomSyncPolling(forceRestart: true);
     }
 
     // ⚠️ IMPORTANT: Initialiser les listeners WebSocket pour les événements backend
@@ -229,7 +228,7 @@ class _GameRoomPageState extends State<GameRoomPage>
           print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
         });
       }
-      _startStateSyncPolling(forceRestart: true);
+      _restartRoomSyncPolling(forceRestart: true);
     });
 
     _wsDisconnectSubscription = wsService.onDisconnect().listen((_) {
@@ -237,7 +236,7 @@ class _GameRoomPageState extends State<GameRoomPage>
       setState(() {
         _isWebSocketConnected = false;
       });
-      _startStateSyncPolling(forceRestart: true);
+      _restartRoomSyncPolling(forceRestart: true);
     });
 
     _wsErrorSubscription = wsService.onError().listen((error) {
@@ -245,7 +244,7 @@ class _GameRoomPageState extends State<GameRoomPage>
       setState(() {
         _isWebSocketConnected = false;
       });
-      _startStateSyncPolling(forceRestart: true);
+      _restartRoomSyncPolling(forceRestart: true);
     });
 
     // Écouter le remplacement d'un joueur par un bot (événement backend)
@@ -1145,69 +1144,119 @@ class _GameRoomPageState extends State<GameRoomPage>
     );
   }
 
-  void _startRoomPolling() {
+  void _restartRoomSyncPolling({bool forceRestart = false}) {
     if (_gameSession.playWithBots) return;
+    if (_stateSyncTimer != null && !forceRestart) return;
+
     _roomPollTimer?.cancel();
-    _roomPollTimer = Timer.periodic(const Duration(seconds: 3), (t) async {
-      try {
-        final roomId = _gameSession.roomId ?? '';
-        if (roomId.isEmpty) return;
-        final res = await GameApiService.instance.getRoom(roomId: roomId);
-        final data = (res['data'] as Map?) ?? res;
-        final players =
-            (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
-        if (players.isEmpty) return;
-        _applyBackendPlayersState(players, startGameIfReady: true);
-      } catch (e) {
-        print('⚠️ Erreur lors du polling des joueurs: $e');
-      }
-    });
+    _roomPollTimer = null;
+    _stateSyncTimer?.cancel();
+
+    final interval = GameRoomPollingPolicy.roomSyncInterval(
+      webSocketConnected: _isWebSocketConnected,
+      waitingForPlayers: _waitingForHumans,
+      announcementPhase: _cardManager.isAnnouncementPhase,
+    );
+    _stateSyncTimer = Timer.periodic(interval, (_) => _pollGameState());
+    print(
+      '🔁 Polling HTTP unifié (${interval.inSeconds}s) - WS=${_isWebSocketConnected ? 'ON' : 'OFF'}',
+    );
   }
 
-  void _startStateSyncPolling({bool forceRestart = false}) {
-    if (_gameSession.playWithBots) return;
-    // ✅ Démarrer le polling même si le jeu n'a pas encore commencé (pour synchroniser les joueurs)
-    // if (!_hasGameStarted) return;
-    if (_stateSyncTimer != null && !forceRestart) return;
-    _stateSyncTimer?.cancel();
-    final interval =
-        _isWebSocketConnected ? _pollIntervalWebSocket : _pollIntervalFallback;
-    _stateSyncTimer = Timer.periodic(interval, (_) => _pollGameState());
-    print('🔁 Polling HTTP actif (${interval.inSeconds}s) - WS=${_isWebSocketConnected ? 'ON' : 'OFF'}');
-  }
+  void _startRoomPolling() => _restartRoomSyncPolling(forceRestart: true);
+
+  void _startStateSyncPolling({bool forceRestart = false}) =>
+      _restartRoomSyncPolling(forceRestart: forceRestart);
 
   Future<void> _pollGameState() async {
     if (!mounted || _gameSession.playWithBots) return;
-    // ✅ Permettre le polling même en attente de joueurs (pour synchroniser les arrivées)
-    // if (_waitingForHumans) return;
+
+    if (GameRoomPollingPolicy.shouldSkipRoomSync(
+      webSocketConnected: _isWebSocketConnected,
+      announcementPhase: _cardManager.isAnnouncementPhase,
+    )) {
+      return;
+    }
+
     final roomId = _gameSession.roomId ?? '';
     if (roomId.isEmpty) return;
     try {
       final res = await GameApiService.instance
-          .getRoom(roomId: roomId)
+          .syncRoom(
+            roomId: roomId,
+            lastChatId: _lastChatMessageId,
+          )
           .timeout(const Duration(seconds: 5));
       final data = (res['data'] as Map?) ?? res;
       final players =
           (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
       if (players.isNotEmpty) {
-        _applyBackendPlayersState(players);
+        _applyBackendPlayersState(
+          players,
+          startGameIfReady: _waitingForHumans,
+        );
       }
+      _applyRoomSyncPayload(data);
       _consecutiveStatePollingErrors = 0;
       _lastSuccessfulStatePoll = DateTime.now();
     } catch (e) {
       _consecutiveStatePollingErrors++;
       print('⚠️ Erreur lors du polling HTTP: $e');
-      if (_consecutiveStatePollingErrors >= 3 && mounted) {
+      if (_consecutiveStatePollingErrors >= 5) {
+        _stateSyncTimer?.cancel();
+        Future.delayed(const Duration(seconds: 30), () {
+          if (mounted) _restartRoomSyncPolling(forceRestart: true);
+        });
+      } else if (_consecutiveStatePollingErrors >= 3 && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: const Text('Connexion instable, tentative de resynchronisation...'),
+            content: const Text(
+              'Connexion instable, tentative de resynchronisation...',
+            ),
             backgroundColor: Colors.orange.shade700,
             duration: const Duration(seconds: 2),
           ),
         );
-        _consecutiveStatePollingErrors = 0;
       }
     }
+  }
+
+  void _applyRoomSyncPayload(Map<String, dynamic> data) {
+    final chat = data['chat'] as Map<String, dynamic>?;
+    if (chat != null && !_isWebSocketConnected) {
+      final raw = (chat['messages'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+      for (final rawMsg in raw) {
+        final id = rawMsg['id'];
+        if (id != null && _chatMessages.any((m) => m['id'] == id)) continue;
+        _chatMessages.add(Map<String, dynamic>.from(rawMsg));
+        if (id is int) {
+          _lastChatMessageId = _lastChatMessageId == null
+              ? id
+              : (id > (_lastChatMessageId ?? 0) ? id : _lastChatMessageId);
+        }
+      }
+      if (raw.isNotEmpty && mounted) setState(() {});
+    }
+
+    if (_isWebSocketConnected) return;
+    final round = data['round'] as Map<String, dynamic>?;
+    if (round == null) return;
+
+    final status = round['status'] as String?;
+    final announcements = round['announcements'] as Map<String, dynamic>?;
+    if (status != 'ANNOUNCEMENT_PHASE' || announcements == null) return;
+
+    for (final entry in announcements.entries) {
+      final playerName = entry.key;
+      final value = (entry.value as num?)?.toInt() ?? 0;
+      final exists = _cardManager.getCurrentRoundAnnouncements().any(
+        (ann) => ann['player'] == playerName,
+      );
+      if (!exists && value >= 2) {
+        _cardManager.makeAnnouncement(playerName, value);
+      }
+    }
+    if (mounted) setState(() {});
   }
 
   void _applyBackendPlayersState(

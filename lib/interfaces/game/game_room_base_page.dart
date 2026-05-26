@@ -383,8 +383,10 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
   @protected
   set continueCountdown(int value);
 
-  static const Duration pollIntervalWebSocket = Duration(seconds: 6);
-  static const Duration pollIntervalFallback = Duration(seconds: 3);
+  @Deprecated('Utiliser GameRoomPollingPolicy.roomSyncInterval')
+  static const Duration pollIntervalWebSocket = Duration(seconds: 12);
+  @Deprecated('Utiliser GameRoomPollingPolicy.roomSyncInterval')
+  static const Duration pollIntervalFallback = Duration(seconds: 6);
 
   // ========== LIFECYCLE ==========
   @override
