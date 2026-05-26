@@ -48,6 +48,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   int _announcementPhaseDuration = 30; // Durée en secondes
   Timer? _announcementPhaseTimer; // Timer pour le compte à rebours
   int? _currentGameId; // ✅ game_id reçu dans announcement_phase_started
+  int? _announcementPhaseRoundApplied;
   bool _waitingForHumans = false;
   bool _isProcessingAnnouncementTurn = false;
   bool _isProcessingAnnouncementCompletion = false;
@@ -980,8 +981,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             testMode: _useTestDistribution,
           ).then((response) {
             print('✅ Backend a distribué les cartes: $response');
-            // La distribution sera reçue via WebSocket dans _cardDistributionSubscription
-            // Pas besoin de configurer le jeu ici, ce sera fait dans le listener
+            // Secours HTTP si WebSocket en retard (timeout Render, join_room manqué)
+            _applyGameStateFromDistributeCardsResponse(response);
           }).catchError((e) {
             print('❌ Erreur lors de la demande de distribution: $e');
             print('❌ ERREUR CRITIQUE: Le backend n\'a pas pu distribuer les cartes');
@@ -1026,6 +1027,148 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     } catch (e) {
       print('❌ Erreur distribution: $e');
     }
+  }
+
+  /// Applique distribution + phase d'annonces depuis la réponse HTTP (secours si WS en retard).
+  void _applyGameStateFromDistributeCardsResponse(Map<String, dynamic> response) {
+    if (!mounted || response['success'] != true) return;
+
+    final raw = response['data'];
+    if (raw is! Map) return;
+    final data = Map<String, dynamic>.from(raw);
+
+    final distribution = data['distribution'] as Map<String, dynamic>?;
+    final roundNumber = (data['round_number'] as num?)?.toInt();
+    final gameIdRaw = data['game_id'];
+    if (gameIdRaw is int) {
+      _currentGameId = gameIdRaw;
+    } else if (gameIdRaw != null) {
+      _currentGameId = int.tryParse(gameIdRaw.toString());
+    }
+
+    if (distribution != null && distribution.isNotEmpty) {
+      final myCards = cardManager.getPlayerCards(widget.currentPlayerName);
+      if (myCards.isEmpty) {
+        print('📥 Application distribution depuis réponse HTTP (secours WS)');
+        _applyCardDistributionPayload(distribution, roundNumber: roundNumber);
+      }
+    }
+
+    final phase = data['announcement_phase'];
+    if (phase is Map) {
+      _handleAnnouncementPhaseStartedPayload(
+        Map<String, dynamic>.from(phase),
+      );
+    }
+  }
+
+  void _applyCardDistributionPayload(
+    Map<String, dynamic> distribution, {
+    int? roundNumber,
+  }) {
+    _syncRoundNumber(roundNumber);
+
+    cardManager.resetRoundCounters();
+    cardManager.clearCurrentTrick();
+
+    for (final entry in distribution.entries) {
+      final playerName = entry.key;
+      final cardCodes = (entry.value as List).cast<String>();
+      final cards = cardCodes.map((code) {
+        return LocalCardManager.instance.getCardByCode(code) ?? {
+          'code': code,
+          'value': code.substring(0, 1),
+          'suit': code.length > 1 ? code.substring(1) : '',
+        };
+      }).toList();
+      cardManager.setPlayerCards(playerName, cards);
+    }
+
+    final playerNames = gameSession.players
+        .map((p) => p['name'] as String? ?? 'Joueur')
+        .toList();
+
+    if (mounted) {
+      setState(() {
+        hasGameStarted = true;
+      });
+    }
+
+    _configureGameAfterDistribution(playerNames);
+  }
+
+  void _handleAnnouncementPhaseStartedPayload(Map<String, dynamic> data) {
+    final roomId = data['roomId'] as String? ?? data['room_id']?.toString();
+    final roundNumber = (data['round_number'] as num?)?.toInt();
+    final startTimestamp = (data['start_timestamp'] as num?)?.toInt();
+    final duration = (data['duration'] as num?)?.toInt() ?? 30;
+    final gameIdRaw = data['game_id'];
+    final gameId =
+        gameIdRaw is int ? gameIdRaw : int.tryParse('$gameIdRaw');
+
+    if (roomId != null &&
+        gameSession.roomId != null &&
+        roomId != gameSession.roomId) {
+      return;
+    }
+    if (startTimestamp == null) return;
+
+    if (roundNumber != null &&
+        _announcementPhaseRoundApplied == roundNumber &&
+        cardManager.isAnnouncementPhase) {
+      if (gameId != null) _currentGameId = gameId;
+      return;
+    }
+
+    if (roundNumber != null) {
+      _announcementPhaseRoundApplied = roundNumber;
+      _syncRoundNumber(roundNumber);
+    }
+
+    print(
+      '🎬 Phase d\'annonces: round=$roundNumber, start=$startTimestamp, game_id=$gameId',
+    );
+
+    _announcementPhaseStartTimestamp = startTimestamp;
+    _announcementPhaseDuration = duration;
+    if (gameId != null) _currentGameId = gameId;
+    hasAnnounced = false;
+
+    _startAnnouncementPhaseTimer(startTimestamp, duration);
+
+    if (mounted) {
+      setState(() {
+        cardManager.isAnnouncementPhase = true;
+      });
+    }
+    _restartRoomSyncPolling(forceRestart: true);
+    _scheduleBotAnnouncementsAfterPhaseStart();
+  }
+
+  void _scheduleBotAnnouncementsAfterPhaseStart() {
+    Future.delayed(const Duration(seconds: 10), () async {
+      if (!mounted || !cardManager.isAnnouncementPhase) return;
+
+      final bots = gameSession.players.where((p) {
+        final isBotValue = p['is_bot'];
+        return isBotValue == true ||
+            isBotValue == 1 ||
+            (isBotValue is String && isBotValue == '1');
+      }).toList();
+
+      for (int i = 0; i < bots.length; i++) {
+        final botName = bots[i]['name'] as String? ?? 'Joueur';
+        Future.delayed(Duration(milliseconds: 300 + (i * 400)), () async {
+          if (!mounted || !cardManager.isAnnouncementPhase) return;
+          final announcements = cardManager.getCurrentRoundAnnouncements();
+          final alreadyAnnounced =
+              announcements.any((ann) => ann['player'] == botName);
+          if (!alreadyAnnounced) {
+            await _sendBotAnnouncementWithRetry(botName);
+          }
+        });
+      }
+    });
   }
 
   Future<void> _configureGameAfterDistribution(List<String> playerNames) async {
@@ -1640,72 +1783,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     // ✅ NOUVEAU: Écouter l'événement de démarrage de la phase d'annonces simultanée
     _announcementPhaseStartedSubscription = wsService.onAnnouncementPhaseStarted().listen((data) {
       if (!mounted) return;
-      
-      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
-      final roundNumber = data['round_number'] as int?;
-      final startTimestamp = data['start_timestamp'] as int?;
-      final duration = data['duration'] as int? ?? 30;
-      final gameId = data['game_id'] as int?; // ✅ Récupérer le game_id depuis l'événement
-      
-      if (roomId == gameSession.roomId &&
-          _matchesRoundNumber(roundNumber) &&
-          startTimestamp != null) {
-        _syncRoundNumber(roundNumber);
-        print('🎬 Phase d\'annonces simultanée démarrée: round=$roundNumber, start=$startTimestamp, duration=$duration, game_id=$gameId');
-        
-        // Stocker les informations de la phase
-        _announcementPhaseStartTimestamp = startTimestamp;
-        _announcementPhaseDuration = duration;
-        _currentGameId = gameId; // ✅ Stocker le game_id pour les annonces
-        _hasAnnounced = false; // Réinitialiser pour ce round
-        
-        // Démarrer le minuteur basé sur le timestamp serveur
-        _startAnnouncementPhaseTimer(startTimestamp, duration);
-        
-        // Afficher le panneau pour tous les joueurs
-        if (mounted) {
-          setState(() {
-            cardManager.isAnnouncementPhase = true;
-          });
-        }
-        _restartRoomSyncPolling(forceRestart: true);
-
-        // ✅ Faire annoncer automatiquement tous les bots après 10 secondes de la phase
-        // ⚠️ Augmenté à 10 secondes pour laisser le temps au cache backend d'être créé
-        Future.delayed(const Duration(seconds: 10), () async {
-          if (!mounted || !cardManager.isAnnouncementPhase) return;
-          
-          final allPlayers = gameSession.players;
-          final bots = allPlayers.where((p) {
-            final isBotValue = p['is_bot'];
-            return isBotValue == true || isBotValue == 1 || (isBotValue is String && isBotValue == '1');
-          }).toList();
-          
-          print('🤖 ${bots.length} bots détectés, annonces automatiques en cours après 10 secondes...');
-          
-          // Faire annoncer chaque bot avec un petit délai progressif pour éviter les conflits
-          for (int i = 0; i < bots.length; i++) {
-            final bot = bots[i];
-            final botName = bot['name'] as String? ?? 'Joueur';
-            
-            Future.delayed(Duration(milliseconds: 300 + (i * 400)), () async {
-              if (!mounted || !cardManager.isAnnouncementPhase) return;
-              
-              // Vérifier si le bot a déjà fait son annonce
-              final announcements = cardManager.getCurrentRoundAnnouncements();
-              final alreadyAnnounced = announcements.any(
-                (ann) => ann['player'] == botName,
-              );
-              
-              if (!alreadyAnnounced) {
-                // ✅ Fonction avec retry pour garantir l'envoi au backend
-                await _sendBotAnnouncementWithRetry(botName);
-              } else {
-                print('⚠️ $botName a déjà fait son annonce, ignoré');
-              }
-            });
-          }
-        });
+      if (data is Map) {
+        _handleAnnouncementPhaseStartedPayload(
+          Map<String, dynamic>.from(data),
+        );
       }
     });
 
@@ -3089,9 +3170,25 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       _ingestChatFromSync(chat);
     }
 
+    final round = data['round'] as Map<String, dynamic>?;
+    if (round != null) {
+      final status = round['status'] as String?;
+      if (status == 'ANNOUNCEMENT_PHASE' && !cardManager.isAnnouncementPhase) {
+        final startTs =
+            (DateTime.now().millisecondsSinceEpoch ~/ 1000) -
+            (30 - ((round['announcement_seconds_remaining'] as num?)?.toInt() ?? 30));
+        _handleAnnouncementPhaseStartedPayload({
+          'room_id': gameSession.roomId,
+          'game_id': gameId,
+          'round_number': round['round_number'],
+          'start_timestamp': startTs,
+          'duration': 30,
+        });
+      }
+    }
+
     if (isWebSocketConnected) return;
 
-    final round = data['round'] as Map<String, dynamic>?;
     if (round == null) return;
 
     final status = round['status'] as String?;
@@ -5565,7 +5662,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             testMode: _useTestDistribution,
           ).then((response) {
             print('✅ Backend a redistribué les cartes: $response');
-            // La distribution sera reçue via WebSocket dans _cardDistributionSubscription
+            _applyGameStateFromDistributeCardsResponse(response);
           }).catchError((e) {
             print('❌ Erreur lors de la demande de redistribution: $e');
             print('❌ ERREUR CRITIQUE: Le backend n\'a pas pu redistribuer les cartes');

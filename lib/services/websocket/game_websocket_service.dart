@@ -15,12 +15,17 @@ class GameWebSocketService {
   String? _currentRoomId;
   String? _currentPlayerName;
   final Map<String, StreamController<dynamic>> _eventControllers = {};
+  Completer<void>? _connectCompleter;
 
   /// Se connecter au serveur Socket.io
   /// 
   /// Utilise l'URL de l'API configurée dans ApiConfig par défaut
   /// Peut être surchargée avec serverUrl pour des tests
   Future<void> connect({String? serverUrl}) async {
+    if (_socket != null && _socket!.connected) {
+      return;
+    }
+
     // Utiliser l'URL fournie ou celle de la configuration
     // Socket.io utilise HTTP/HTTPS, pas ws/wss directement
     var url = serverUrl ?? ApiConfig.websocketUrl;
@@ -35,29 +40,47 @@ class GameWebSocketService {
     print('🔌 Tentative de connexion Socket.io à: $url');
     
     try {
+      _connectCompleter = Completer<void>();
+
       _socket = IO.io(
         url,
         IO.OptionBuilder()
-            .setTransports(['websocket', 'polling']) // Essayer WebSocket d'abord, puis polling
+            .setTransports(['polling', 'websocket'])
             .enableAutoConnect()
             .enableReconnection()
             .setReconnectionDelay(1000)
             .setReconnectionDelayMax(5000)
-            .setReconnectionAttempts(5)
+            .setReconnectionAttempts(8)
+            .setTimeout(25000)
             .build(),
       );
 
       // Écouter la connexion
       _socket!.onConnect((_) {
         print('✅ Connexion Socket.io établie');
+        if (_connectCompleter != null && !_connectCompleter!.isCompleted) {
+          _connectCompleter!.complete();
+        }
         if (_eventControllers.containsKey('connect')) {
           _eventControllers['connect']!.add(null);
+        }
+        if (_currentRoomId != null &&
+            _currentRoomId!.isNotEmpty &&
+            _currentPlayerName != null &&
+            _currentPlayerName!.isNotEmpty) {
+          _emit('join_room', {
+            'roomId': _currentRoomId,
+            'playerName': _currentPlayerName,
+          });
         }
       });
 
       // Écouter les erreurs de connexion
       _socket!.onConnectError((error) {
         print('❌ Erreur de connexion Socket.io: $error');
+        if (_connectCompleter != null && !_connectCompleter!.isCompleted) {
+          _connectCompleter!.completeError(error);
+        }
         _handleError(error);
       });
 
@@ -74,12 +97,18 @@ class GameWebSocketService {
 
       // Connecter
       _socket!.connect();
-      
+
+      await _connectCompleter!.future.timeout(
+        const Duration(seconds: 25),
+        onTimeout: () {
+          print('❌ Timeout connexion Socket.io (25s)');
+          throw TimeoutException('Socket.io connection timeout');
+        },
+      );
     } catch (e) {
       print('❌ Erreur lors de l\'initialisation Socket.io: $e');
-      // Ne pas rethrow pour éviter de bloquer l'application
-      // L'application peut fonctionner sans WebSocket (mode local)
-      _socket = null;
+      _connectCompleter = null;
+      // Ne pas rethrow : l'app continue via HTTP /sync
     }
   }
 
@@ -142,7 +171,16 @@ class GameWebSocketService {
   Future<void> joinRoom(String roomId, String playerName) async {
     _currentRoomId = roomId;
     _currentPlayerName = playerName;
-    
+
+    if (_socket == null || !_socket!.connected) {
+      try {
+        await connect();
+      } catch (e) {
+        print('⚠️ joinRoom: WebSocket indisponible ($e)');
+        return;
+      }
+    }
+
     await _emit('join_room', {
       'roomId': roomId,
       'playerName': playerName,
