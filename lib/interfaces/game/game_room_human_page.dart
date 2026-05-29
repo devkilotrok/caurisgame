@@ -51,6 +51,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   Timer? _announcementPhaseTimer; // Timer pour le compte à rebours
   int? _currentGameId; // ✅ game_id reçu dans announcement_phase_started
   int? _announcementPhaseRoundApplied;
+  int? _distributionRoundApplied;
   bool _waitingForHumans = false;
   bool _isProcessingAnnouncementTurn = false;
   bool _isProcessingAnnouncementCompletion = false;
@@ -100,6 +101,77 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     return gameSession.currentRound > 0 ? gameSession.currentRound : 1;
   }
 
+
+
+  bool _needsDistributionApply(int? roundNumber) {
+    if (cardManager.getPlayerCards(widget.currentPlayerName).isEmpty) {
+      return true;
+    }
+    if (roundNumber == null) return false;
+    return _distributionRoundApplied != roundNumber;
+  }
+
+  void _markDistributionApplied(int? roundNumber) {
+    if (roundNumber != null) {
+      _distributionRoundApplied = roundNumber;
+    }
+  }
+
+  Map<String, dynamic> _canonicalizeDistributionKeys(
+    Map<String, dynamic> distribution,
+  ) {
+    final knownNames = gameSession.players
+        .map((p) => (p['name'] as String?)?.trim() ?? '')
+        .where((n) => n.isNotEmpty)
+        .toList();
+
+    final canonical = <String, dynamic>{};
+    for (final entry in distribution.entries) {
+      final rawKey = entry.key.toString().trim();
+      String resolved = rawKey;
+      for (final name in knownNames) {
+        if (name.toLowerCase() == rawKey.toLowerCase()) {
+          resolved = name;
+          break;
+        }
+      }
+      canonical[resolved] = entry.value;
+    }
+    return canonical;
+  }
+
+  bool _validateFullDistribution(Map<String, dynamic> distribution) {
+    final allDistributedCards = <String>{};
+    var totalCardsDistributed = 0;
+
+    for (final entry in distribution.entries) {
+      final cardCodes = (entry.value as List).cast<String>();
+      totalCardsDistributed += cardCodes.length;
+
+      if (cardCodes.length != cardCodes.toSet().length) {
+        print('❌ Distribution invalide: doublons pour ${entry.key}');
+        return false;
+      }
+
+      for (final code in cardCodes) {
+        if (allDistributedCards.contains(code)) {
+          print('❌ Distribution invalide: carte $code en double entre joueurs');
+          return false;
+        }
+        allDistributedCards.add(code);
+      }
+    }
+
+    if (totalCardsDistributed != 52) {
+      print(
+        '❌ Distribution invalide: $totalCardsDistributed/52 cartes '
+        '(joueurs: ${distribution.keys.toList()})',
+      );
+      return false;
+    }
+
+    return true;
+  }
 
   bool _roomIdsMatch(Object? a, Object? b) {
     if (a == null || b == null) return false;
@@ -1098,6 +1170,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       } else {
         print('⏳ En attente de la distribution via WebSocket...');
         _scheduleDistributionSyncFallback();
+        unawaited(_ensureMyCardsFromSyncIfMissing());
       }
     } catch (e) {
       print('❌ Erreur distribution: $e');
@@ -1121,12 +1194,16 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       _currentGameId = int.tryParse(gameIdRaw.toString());
     }
 
-    if (distribution != null && distribution.isNotEmpty) {
-      final myCards = cardManager.getPlayerCards(widget.currentPlayerName);
-      if (myCards.isEmpty) {
-        print('📥 Application distribution depuis réponse HTTP (secours WS)');
-        _applyCardDistributionPayload(distribution, roundNumber: roundNumber);
-      }
+    if (distribution != null &&
+        distribution.isNotEmpty &&
+        _needsDistributionApply(roundNumber)) {
+      print('📥 Application distribution depuis réponse HTTP (créateur)');
+      _applyCardDistributionPayload(
+        _canonicalizeDistributionKeys(
+          Map<String, dynamic>.from(distribution),
+        ),
+        roundNumber: roundNumber,
+      );
     }
 
     final phase = data['announcement_phase'];
@@ -1142,13 +1219,20 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     int? roundNumber,
     bool skipConfigureIfAnnouncementActive = false,
   }) {
+    final normalized = _canonicalizeDistributionKeys(distribution);
+    if (!_validateFullDistribution(normalized)) {
+      print('⚠️ Distribution ignorée (validation échouée)');
+      return;
+    }
+
     _cancelDistributionSyncFallback();
     _syncRoundNumber(roundNumber);
+    _markDistributionApplied(roundNumber);
 
     cardManager.resetRoundCounters();
     cardManager.clearCurrentTrick();
 
-    for (final entry in distribution.entries) {
+    for (final entry in normalized.entries) {
       final playerName = entry.key.toString();
       final cardCodes = (entry.value as List).cast<String>();
       final cards = cardCodes.map((code) {
@@ -1462,205 +1546,40 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     // ✅ NOUVEAU: Écouter la distribution de cartes
     _cardDistributionSubscription = wsService.onCardDistribution().listen((data) {
+      print('🃏 card_distribution brut: $data');
       if (!mounted) return;
-      
-      print('📥 Événement card_distribution reçu via WebSocket: $data');
-      
-      final distribution = data['distribution'] as Map<String, dynamic>?;
+
+      final distributionRaw = data['distribution'] as Map<String, dynamic>?;
       final roundNumber = (data['round_number'] as num?)?.toInt();
       final roomId = (data['roomId'] ?? data['room_id'])?.toString();
-      
-      if (distribution == null) {
-        print('⚠️ Distribution null dans l\'événement');
+
+      if (distributionRaw == null || distributionRaw.isEmpty) {
+        print('⚠️ Distribution null/vide dans card_distribution');
         return;
       }
-      
+
       if (roomId != null && !_roomIdsMatch(roomId, gameSession.roomId)) {
         print('⚠️ Room ID ne correspond pas: $roomId vs ${gameSession.roomId}');
         return;
       }
-      
-      // ✅ Vérifier si c'est le créateur qui reçoit sa propre distribution
-      final isCreator = gameSession.players.any(
-        (p) => (p['name'] as String?) == widget.currentPlayerName &&
-            (p['isCreator'] as bool?) == true,
+
+      if (!_needsDistributionApply(roundNumber)) {
+        print('ℹ️ Distribution round=$roundNumber déjà appliquée localement');
+        return;
+      }
+
+      print(
+        '📥 Application distribution WS round=$roundNumber '
+        'pour ${widget.currentPlayerName}',
       );
-      
-      // ✅ Si c'est le créateur et qu'il a déjà ses cartes, ignorer la distribution reçue
-      if (isCreator) {
-        final currentPlayerCards = cardManager.getPlayerCards(widget.currentPlayerName);
-        if (currentPlayerCards.isNotEmpty) {
-          print('ℹ️ Créateur: distribution déjà appliquée localement, sync round=$roundNumber');
-          _syncRoundNumber(roundNumber);
-          final playerNames = gameSession.players
-              .map((p) => p['name'] as String? ?? 'Joueur')
-              .toList();
-          _configureGameAfterDistribution(playerNames);
-          return;
-        }
-      }
-      
-      print('📥 Distribution reçue pour le round $roundNumber');
-      print('   Joueurs dans la distribution: ${distribution.keys.toList()}');
-      _cancelDistributionSyncFallback();
-      
-      _syncRoundNumber(roundNumber);
-      
-      // ✅ Appliquer la distribution reçue
-      final playerNames = gameSession.players
-          .map((p) => p['name'] as String? ?? 'Joueur')
-          .toList();
-      
-      // Réinitialiser le manager
-      cardManager.resetRoundCounters();
-      // ✅ S'assurer que le trick est bien vidé (double sécurité)
-      cardManager.clearCurrentTrick();
-      
-      // ✅ VALIDATION: Vérifier que toutes les 52 cartes sont distribuées et qu'il n'y a pas de doublons
-      final Set<String> allDistributedCards = {};
-      final Map<String, List<String>> playerCardLists = {};
-      int totalCardsDistributed = 0;
-      
-      for (final entry in distribution.entries) {
-        final playerName = entry.key as String;
-        final cardCodes = (entry.value as List).cast<String>();
-        playerCardLists[playerName] = cardCodes;
-        totalCardsDistributed += cardCodes.length;
-        
-        // ✅ Vérifier les doublons pour ce joueur
-        final uniqueCardsForPlayer = cardCodes.toSet();
-        if (cardCodes.length != uniqueCardsForPlayer.length) {
-          print('❌ ERREUR CRITIQUE: Doublons détectés pour $playerName!');
-          print('   Cartes: $cardCodes');
-          final duplicates = <String, int>{};
-          for (final code in cardCodes) {
-            duplicates[code] = (duplicates[code] ?? 0) + 1;
-          }
-          duplicates.removeWhere((key, value) => value == 1);
-          print('   Doublons: $duplicates');
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Erreur: Doublons détectés pour $playerName. Distribution invalide.'),
-                backgroundColor: Colors.red,
-                duration: const Duration(seconds: 5),
-                behavior: SnackBarBehavior.floating,
-                margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              ),
-            );
-          }
-          return; // ❌ NE PAS APPLIQUER cette distribution invalide
-        }
-        
-        // ✅ Vérifier les doublons entre joueurs
-        for (final code in cardCodes) {
-          if (allDistributedCards.contains(code)) {
-            print('❌ ERREUR CRITIQUE: Carte $code distribuée à plusieurs joueurs!');
-            // Trouver quel autre joueur a cette carte
-            for (final otherEntry in playerCardLists.entries) {
-              if (otherEntry.key != playerName && otherEntry.value.contains(code)) {
-                print('   Carte $code également distribuée à: ${otherEntry.key}');
-              }
-            }
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text('Erreur: Carte $code distribuée à plusieurs joueurs!'),
-                  backgroundColor: Colors.red,
-                  duration: const Duration(seconds: 5),
-                  behavior: SnackBarBehavior.floating,
-                  margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                ),
-              );
-            }
-            return; // ❌ NE PAS APPLIQUER cette distribution invalide
-          }
-          allDistributedCards.add(code);
-        }
-      }
-      
-      // ✅ Vérifier que toutes les 52 cartes sont distribuées
-      if (totalCardsDistributed != 52) {
-        print('❌ ERREUR CRITIQUE: Nombre total de cartes incorrect!');
-        print('   Attendu: 52 cartes');
-        print('   Reçu: $totalCardsDistributed cartes');
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Erreur: Nombre de cartes incorrect ($totalCardsDistributed/52).'),
-              backgroundColor: Colors.red,
-              duration: const Duration(seconds: 5),
-              behavior: SnackBarBehavior.floating,
-              margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            ),
-          );
-        }
-        return; // ❌ NE PAS APPLIQUER cette distribution invalide
-      }
-      
-      print('✅ Validation réussie: 52 cartes distribuées, aucune carte en commun entre joueurs');
-      print('   Total cartes: $totalCardsDistributed');
-      print('   Joueurs: ${distribution.keys.toList()}');
-      
-      // ✅ Appliquer la distribution validée
-      bool hasCurrentPlayerCards = false;
-      for (final entry in distribution.entries) {
-        final playerName = entry.key as String;
-        final cardCodes = (entry.value as List).cast<String>();
-        
-        print('📥 Distribution pour "$playerName": ${cardCodes.length} cartes');
-        print('   Joueur actuel: "${widget.currentPlayerName}"');
-        print('   Correspondance: ${playerName == widget.currentPlayerName}');
-        
-        // Construire les cartes à partir des codes
-        final cards = cardCodes.map((code) {
-          return LocalCardManager.instance.getCardByCode(code) ?? {
-            'code': code,
-            'value': code.substring(0, 1),
-            'suit': code.substring(1),
-          };
-        }).toList();
-        
-        // ✅ Assigner les cartes au joueur
-        cardManager.setPlayerCards(playerName, cards);
-        
-        // ✅ Vérifier que les cartes ont bien été assignées
-        final assignedCards = cardManager.getPlayerCards(playerName);
-        print('   ✅ Cartes assignées: ${assignedCards.length} cartes');
-        
-        if (playerName == widget.currentPlayerName) {
-          hasCurrentPlayerCards = true;
-          print('   👤 C\'est le joueur actuel - cartes devraient être visibles');
-          // ✅ Vérifier immédiatement après assignation
-          final verifyCards = cardManager.getPlayerCards(widget.currentPlayerName);
-          print('   🔍 Vérification: ${verifyCards.length} cartes pour le joueur actuel');
-        }
-      }
-      
-      // ✅ Vérifier que le joueur actuel a bien reçu ses cartes
-      if (!hasCurrentPlayerCards) {
-        print('⚠️ ATTENTION: Le joueur actuel (${widget.currentPlayerName}) n\'a pas de cartes dans la distribution reçue');
-        print('   Joueurs dans la distribution: ${distribution.keys.toList()}');
-      }
-      
-      // ✅ Forcer la mise à jour de l'UI pour afficher les cartes
-      if (mounted) {
-        setState(() {
-          // ✅ Marquer que le jeu a démarré pour éviter les demandes de redistribution
-          hasGameStarted = true;
-        });
-        print('✅ setState appelé après distribution - UI devrait être mise à jour');
-        print('✅ Jeu marqué comme démarré (hasGameStarted = true)');
-      }
-      
-      // ✅ Configurer le jeu
-      _configureGameAfterDistribution(playerNames);
+
+      _applyCardDistributionPayload(
+        Map<String, dynamic>.from(distributionRaw),
+        roundNumber: roundNumber,
+      );
     });
 
-    playerReplacedSubscription = wsService.onPlayerReplaced().listen((data) {
+        playerReplacedSubscription = wsService.onPlayerReplaced().listen((data) {
       if (mounted) {
         final playerName = data['player_name'] as String?;
         final botName = data['bot_name'] as String?;
@@ -3313,12 +3232,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     final raw = round['distributed_cards'];
     if (raw is! Map || raw.isEmpty) return;
 
-    if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
+    final roundNumber = (round['round_number'] as num?)?.toInt();
+    if (!_needsDistributionApply(roundNumber)) {
       return;
     }
 
-    final distribution = Map<String, dynamic>.from(raw);
-    final roundNumber = (round['round_number'] as num?)?.toInt();
+    final distribution = _canonicalizeDistributionKeys(
+      Map<String, dynamic>.from(raw),
+    );
 
     print(
       '📥 Cartes récupérées via /sync pour ${widget.currentPlayerName} '
