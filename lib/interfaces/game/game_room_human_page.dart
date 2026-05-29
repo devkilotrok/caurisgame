@@ -320,52 +320,40 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     await _pullDistributionFromSync();
   }
 
+  static const List<Duration> _distributionSyncRetryDelays = [
+    Duration(milliseconds: 800),
+    Duration(seconds: 3),
+    Duration(seconds: 5),
+    Duration(seconds: 8),
+    Duration(seconds: 12),
+  ];
+
   void _scheduleDistributionSyncFallback() {
     _cancelDistributionSyncFallback();
     _distributionFallbackTimer = Timer(
-      GameRoomPollingPolicy.distributionFirstRetryDelay,
-      () async {
-        if (!mounted) return;
-        if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
-          return;
-        }
-        print('⚠️ Secours /sync (1ère tentative, WS a peut-être manqué card_distribution)');
-        await _pullDistributionFromSync();
-        if (!mounted) return;
-        if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
-          return;
-        }
-        _distributionFallbackTimer = Timer(
-          GameRoomPollingPolicy.distributionFallbackDelay,
-          () async {
-            if (!mounted) return;
-            if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
-              return;
-            }
-            print(
-              '⚠️ Secours /sync (2e tentative après '
-              '${GameRoomPollingPolicy.distributionFallbackDelay.inSeconds}s)',
-            );
-            await _pullDistributionFromSync();
-            if (!mounted) return;
-            if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
-              return;
-            }
-            _distributionFallbackTimer = Timer(
-              const Duration(seconds: 10),
-              () async {
-                if (!mounted) return;
-                if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
-                  return;
-                }
-                print('⚠️ Secours /sync (3e tentative après 10s supplémentaires)');
-                await _pullDistributionFromSync();
-              },
-            );
-          },
-        );
-      },
+      _distributionSyncRetryDelays.first,
+      () => unawaited(_runDistributionSyncRetries()),
     );
+  }
+
+  Future<void> _runDistributionSyncRetries() async {
+    for (var i = 0; i < _distributionSyncRetryDelays.length; i++) {
+      if (!mounted || gameSession.playWithBots) return;
+      if (_localPlayerHasCards()) return;
+
+      if (i > 0) {
+        print(
+          '⚠️ Secours /sync (tentative ${i + 1}/'
+          '${_distributionSyncRetryDelays.length})',
+        );
+        await Future.delayed(_distributionSyncRetryDelays[i]);
+        if (!mounted || _localPlayerHasCards()) return;
+      } else {
+        print('⚠️ Secours /sync (1ère tentative, WS a peut-être manqué card_distribution)');
+      }
+
+      await _pullDistributionFromSync();
+    }
   }
 
   /// Récupère cartes + game_id via GET /rooms/{id}/sync (secours WS uniquement).
@@ -382,6 +370,13 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       );
       final data = Map<String, dynamic>.from(
         (res['data'] as Map?) ?? res as Map,
+      );
+      final round = data['round'] as Map<String, dynamic>?;
+      final distributed = round?['distributed_cards'];
+      final hasCards = distributed is Map && distributed.isNotEmpty;
+      print(
+        '🔍 Sync room=$roomId round=${round?['round_number']} '
+        'has_distributed_cards=$hasCards',
       );
       _applyRoomSyncPayload(data);
     } catch (e) {
@@ -1252,7 +1247,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     _distributionRequestInFlight = true;
     print(
-      '👑 Créateur: attente de $requiredPlayers joueurs (HTTP + WebSocket)...',
+      '👑 Créateur: attente de $requiredPlayers joueurs en salle (HTTP)...',
     );
 
     try {
@@ -1269,17 +1264,16 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           final expected = _expectedHumanPlayerNames();
           final missing = expected.difference(_wsJoinedPlayerNames);
           print(
-            '⏳ WS: ${_wsJoinedPlayerNames.length}/$requiredPlayers connectés'
-            '${missing.isEmpty ? '' : ' — manque: ${missing.join(", ")}'}',
+            'ℹ️ WS: ${_wsJoinedPlayerNames.length}/$requiredPlayers'
+            '${missing.isEmpty ? '' : ' — manque: ${missing.join(", ")}'} '
+            '(distribution via BDD + replay WS)',
           );
-          await Future.delayed(const Duration(seconds: 2));
-          continue;
+        } else {
+          print(
+            '👑 Salle prête (${gameSession.players.length} HTTP, '
+            '${_wsJoinedPlayerNames.length} WS) — distribution...',
+          );
         }
-
-        print(
-          '👑 Salle prête (${gameSession.players.length} HTTP, '
-          '${_wsJoinedPlayerNames.length} WS) — distribution...',
-        );
 
         try {
           final response = await GameApiService.instance.distributeCards(
@@ -1322,7 +1316,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'En attente des $requiredPlayers joueurs connectés au WebSocket...',
+              'En attente des $requiredPlayers joueurs dans la salle...',
             ),
             backgroundColor: Colors.orange,
             duration: const Duration(seconds: 5),
@@ -1840,6 +1834,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             print('⏸️ Annonce ignorée — cartes manquantes');
             unawaited(_ensureMyCardsFromSyncIfMissing());
             return;
+          }
+
+          if (gameSession.currentRound < 1) {
+            _syncRoundNumber(1);
           }
           
           // ✅ Vérifier si l'annonce n'existe pas déjà (éviter les doublons)
@@ -3569,18 +3567,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     if (startGameIfReady &&
         normalized.length >= requiredPlayers &&
-        !hasGameStarted &&
-        _hasAllPlayersJoinedWebSocket()) {
+        !hasGameStarted) {
       waitingForHumans = false;
       _restartRoomSyncPolling(forceRestart: true);
       startCardDistribution();
-    } else if (startGameIfReady &&
-        normalized.length >= requiredPlayers &&
-        !hasGameStarted) {
-      print(
-        '⏳ ${normalized.length}/$requiredPlayers joueurs HTTP — '
-        'attente WS (${_wsJoinedPlayerNames.length}/$requiredPlayers)',
-      );
     }
   }
 

@@ -16,6 +16,26 @@ class GameWebSocketService {
   String? _currentPlayerName;
   final Map<String, StreamController<dynamic>> _eventControllers = {};
   Completer<void>? _connectCompleter;
+  String? _lastJoinedRoomKey;
+
+  /// Évite les join_room en double (onConnect + joinRoom appelé depuis l'UI).
+  Future<void> _emitJoinRoomIfNeeded() async {
+    if (_currentRoomId == null ||
+        _currentRoomId!.isEmpty ||
+        _currentPlayerName == null ||
+        _currentPlayerName!.isEmpty) {
+      return;
+    }
+    final key = '${_currentRoomId!}|${_currentPlayerName!}';
+    if (_lastJoinedRoomKey == key && (_socket?.connected ?? false)) {
+      return;
+    }
+    _lastJoinedRoomKey = key;
+    await _emit('join_room', {
+      'roomId': _currentRoomId.toString(),
+      'playerName': _currentPlayerName,
+    });
+  }
 
   /// Se connecter au serveur Socket.io
   /// 
@@ -65,15 +85,7 @@ class GameWebSocketService {
         if (_eventControllers.containsKey('connect')) {
           _eventControllers['connect']!.add(null);
         }
-        if (_currentRoomId != null &&
-            _currentRoomId!.isNotEmpty &&
-            _currentPlayerName != null &&
-            _currentPlayerName!.isNotEmpty) {
-          _emit('join_room', {
-            'roomId': _currentRoomId.toString(),
-            'playerName': _currentPlayerName,
-          });
-        }
+        unawaited(_emitJoinRoomIfNeeded());
       });
 
       // Écouter les erreurs de connexion
@@ -87,7 +99,11 @@ class GameWebSocketService {
 
       // Écouter la déconnexion
       _socket!.onDisconnect((reason) {
-        print('🔌 Déconnexion Socket.io: $reason');
+        _lastJoinedRoomKey = null;
+        print(
+          '🔌 Déconnexion Socket.io: $reason '
+          '(room=$_currentRoomId, player=$_currentPlayerName)',
+        );
         _handleDisconnect();
       });
 
@@ -182,10 +198,7 @@ class GameWebSocketService {
       }
     }
 
-    await _emit('join_room', {
-      'roomId': roomId.toString(),
-      'playerName': playerName,
-    });
+    await _emitJoinRoomIfNeeded();
   }
 
   /// Quitter une salle
@@ -369,6 +382,7 @@ class GameWebSocketService {
     _socket?.disconnect();
     _socket?.dispose();
     _socket = null;
+    _lastJoinedRoomKey = null;
     
     // Fermer tous les controllers
     for (var controller in _eventControllers.values) {
