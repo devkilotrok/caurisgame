@@ -103,6 +103,39 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
 
 
+  Map<String, dynamic>? _parseDistributedCards(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is String && raw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          return Map<String, dynamic>.from(decoded);
+        }
+      } catch (e) {
+        print('⚠️ distributed_cards JSON invalide: $e');
+      }
+      return null;
+    }
+    if (raw is Map) {
+      return Map<String, dynamic>.from(raw);
+    }
+    return null;
+  }
+
+  @override
+  Future<void> handleAnnouncementTurnComplete() async {
+    if (cardManager.getPlayerCards(widget.currentPlayerName).isEmpty) {
+      print('⚠️ Pas de cartes — /sync avant passage en phase de jeu');
+      await _pullDistributionFromSync();
+      if (cardManager.getPlayerCards(widget.currentPlayerName).isEmpty) {
+        print('❌ Phase de jeu bloquée: cartes toujours absentes après /sync');
+        _scheduleDistributionSyncFallback();
+        return;
+      }
+    }
+    await super.handleAnnouncementTurnComplete();
+  }
+
   bool _needsDistributionApply(int? roundNumber) {
     if (cardManager.getPlayerCards(widget.currentPlayerName).isEmpty) {
       return true;
@@ -239,6 +272,21 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
               '${GameRoomPollingPolicy.distributionFallbackDelay.inSeconds}s)',
             );
             await _pullDistributionFromSync();
+            if (!mounted) return;
+            if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
+              return;
+            }
+            _distributionFallbackTimer = Timer(
+              const Duration(seconds: 10),
+              () async {
+                if (!mounted) return;
+                if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
+                  return;
+                }
+                print('⚠️ Secours /sync (3e tentative après 10s supplémentaires)');
+                await _pullDistributionFromSync();
+              },
+            );
           },
         );
       },
@@ -1658,6 +1706,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             announcement != null && 
             roomId == gameSession.roomId) {
           print('📡 Annonce reçue via WebSocket: $playerName → $announcement plis');
+
+          if (cardManager.getPlayerCards(widget.currentPlayerName).isEmpty) {
+            unawaited(_ensureMyCardsFromSyncIfMissing());
+          }
           
           // ✅ Vérifier si l'annonce n'existe pas déjà (éviter les doublons)
           final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
@@ -1700,7 +1752,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             if (gameId != null) {
               final turnData = await GameApiService.instance.getAnnouncementTurn(
                 gameId: gameId,
-                roundNumber: roundNumber,
+                roundNumber: _effectiveRoundNumber(),
               );
               
               if (turnData['all_announced'] == true) {
@@ -3229,25 +3281,29 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   }
 
   void _applyDistributionFromSyncRound(Map<String, dynamic> round) {
-    final raw = round['distributed_cards'];
-    if (raw is! Map || raw.isEmpty) return;
+    final distribution = _parseDistributedCards(round['distributed_cards']);
+    if (distribution == null || distribution.isEmpty) {
+      print(
+        '⚠️ /sync: distributed_cards absent ou vide '
+        '(round=${round['round_number']}, status=${round['status']})',
+      );
+      return;
+    }
 
     final roundNumber = (round['round_number'] as num?)?.toInt();
     if (!_needsDistributionApply(roundNumber)) {
       return;
     }
 
-    final distribution = _canonicalizeDistributionKeys(
-      Map<String, dynamic>.from(raw),
-    );
+    final normalized = _canonicalizeDistributionKeys(distribution);
 
     print(
       '📥 Cartes récupérées via /sync pour ${widget.currentPlayerName} '
-      '(round $roundNumber, ${distribution.length} joueurs)',
+      '(round $roundNumber, ${normalized.length} joueurs)',
     );
 
     _applyCardDistributionPayload(
-      distribution,
+      normalized,
       roundNumber: roundNumber,
       skipConfigureIfAnnouncementActive: cardManager.isAnnouncementPhase,
     );
