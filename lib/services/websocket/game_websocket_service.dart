@@ -45,13 +45,14 @@ class GameWebSocketService {
       _socket = IO.io(
         url,
         IO.OptionBuilder()
-            .setTransports(['polling', 'websocket'])
+            // WebSocket en premier : serveur Render Starter toujours actif
+            .setTransports(['websocket', 'polling'])
             .enableAutoConnect()
             .enableReconnection()
             .setReconnectionDelay(1000)
             .setReconnectionDelayMax(5000)
-            .setReconnectionAttempts(8)
-            .setTimeout(25000)
+            .setReconnectionAttempts(10)
+            .setTimeout(15000)
             .build(),
       );
 
@@ -99,9 +100,9 @@ class GameWebSocketService {
       _socket!.connect();
 
       await _connectCompleter!.future.timeout(
-        const Duration(seconds: 25),
+        const Duration(seconds: 15),
         onTimeout: () {
-          print('❌ Timeout connexion Socket.io (25s)');
+          print('❌ Timeout connexion Socket.io (15s)');
           throw TimeoutException('Socket.io connection timeout');
         },
       );

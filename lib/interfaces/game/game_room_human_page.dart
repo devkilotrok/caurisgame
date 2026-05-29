@@ -37,6 +37,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   Timer? _continueCountdownTimer;
   Timer? _roomCodeCheckTimer;
   Timer? _countersSyncTimer; // ✅ Timer pour synchroniser les compteurs de plis automatiquement
+  Timer? _distributionFallbackTimer;
+  bool _forceSyncDistribution = false;
 
   // États bool/int
   int _announcementCountdown = 30;
@@ -106,8 +108,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
   Future<int?> _resolveGameId() async {
     if (_currentGameId != null) return _currentGameId;
-    await _pullDistributionFromSync();
-    if (_currentGameId != null) return _currentGameId;
     try {
       final id = await getGameId();
       if (id != null) {
@@ -116,16 +116,44 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       return id;
     } catch (e) {
       print('⚠️ Impossible de résoudre gameId: $e');
-      return null;
     }
+    if (_currentGameId == null && !isWebSocketConnected) {
+      await _pullDistributionFromSync();
+    }
+    return _currentGameId;
   }
 
-  /// Récupère cartes + game_id via GET /rooms/{id}/sync (joueurs non-créateurs, WS coupé).
+  void _cancelDistributionSyncFallback() {
+    _distributionFallbackTimer?.cancel();
+    _distributionFallbackTimer = null;
+  }
+
+  /// Secours HTTP uniquement si le WebSocket n'a pas livré les cartes à temps.
+  void _scheduleDistributionSyncFallback() {
+    _cancelDistributionSyncFallback();
+    _distributionFallbackTimer = Timer(
+      GameRoomPollingPolicy.distributionFallbackDelay,
+      () async {
+        if (!mounted) return;
+        if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
+          return;
+        }
+        print(
+          '⚠️ Pas de cartes via WebSocket après '
+          '${GameRoomPollingPolicy.distributionFallbackDelay.inSeconds}s — secours /sync',
+        );
+        await _pullDistributionFromSync();
+      },
+    );
+  }
+
+  /// Récupère cartes + game_id via GET /rooms/{id}/sync (secours WS uniquement).
   Future<void> _pullDistributionFromSync() async {
     if (!mounted || gameSession.playWithBots) return;
     final roomId = gameSession.roomId ?? '';
     if (roomId.isEmpty) return;
 
+    _forceSyncDistribution = true;
     try {
       final res = await GameApiService.instance.syncRoom(
         roomId: roomId,
@@ -137,6 +165,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       _applyRoomSyncPayload(data);
     } catch (e) {
       print('⚠️ sync distribution: $e');
+    } finally {
+      _forceSyncDistribution = false;
     }
   }
   StreamSubscription? _cardDistributionSubscription;
@@ -507,6 +537,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     continueCountdownTimer?.cancel();
     roomCodeCheckTimer?.cancel();
     _countersSyncTimer?.cancel(); // ✅ Annuler le timer de synchronisation des compteurs
+    _cancelDistributionSyncFallback();
 
     wsConnectSubscription?.cancel();
     wsDisconnectSubscription?.cancel();
@@ -1039,9 +1070,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           }
         }
       } else {
-        print('⏳ En attente de la distribution des cartes (sync HTTP)...');
-        await _pullDistributionFromSync();
-        _restartRoomSyncPolling(forceRestart: true);
+        print('⏳ En attente de la distribution via WebSocket...');
+        _scheduleDistributionSyncFallback();
       }
     } catch (e) {
       print('❌ Erreur distribution: $e');
@@ -1086,6 +1116,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     int? roundNumber,
     bool skipConfigureIfAnnouncementActive = false,
   }) {
+    _cancelDistributionSyncFallback();
     _syncRoundNumber(roundNumber);
 
     cardManager.resetRoundCounters();
@@ -1364,31 +1395,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
   void _initializeWebSocketListeners() {
     final wsService = GameWebSocketService();
-    
-    if (!wsService.isConnected) {
-      wsService.connect().then((_) {
-        final roomId = gameSession.roomId;
-        final playerName = widget.currentPlayerName;
-        if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
-          wsService.joinRoom(roomId, playerName).catchError((error) {
-            print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
-          });
-        }
-      }).catchError((error) {
-        print('⚠️ Impossible de se connecter au WebSocket: $error');
-      });
-    } else {
-      final roomId = gameSession.roomId;
-      final playerName = widget.currentPlayerName;
-      if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
-        wsService.joinRoom(roomId, playerName).catchError((error) {
-          print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
-        });
-      }
-    }
-    setState(() {
-      isWebSocketConnected = wsService.isConnected;
-    });
 
     wsConnectSubscription = wsService.onConnect().listen((_) {
       if (!mounted) return;
@@ -1425,12 +1431,12 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     // ✅ NOUVEAU: Écouter la distribution de cartes
     _cardDistributionSubscription = wsService.onCardDistribution().listen((data) {
       if (!mounted) return;
-      
-      print('📥 Événement card_distribution reçu: $data');
-      
+
+      print('📥 Événement card_distribution reçu via WebSocket: $data');
+
       final distribution = data['distribution'] as Map<String, dynamic>?;
-      final roundNumber = data['round_number'] as int?;
-      final roomId = data['roomId'] as String?;
+      final roundNumber = (data['round_number'] as num?)?.toInt();
+      final roomId = (data['roomId'] ?? data['room_id'])?.toString();
       
       if (distribution == null) {
         print('⚠️ Distribution null dans l\'événement');
@@ -1464,6 +1470,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       
       print('📥 Distribution reçue pour le round $roundNumber');
       print('   Joueurs dans la distribution: ${distribution.keys.toList()}');
+      _cancelDistributionSyncFallback();
       
       _syncRoundNumber(roundNumber);
       
@@ -2108,6 +2115,31 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         }
       }
     });
+
+    setState(() {
+      isWebSocketConnected = wsService.isConnected;
+    });
+
+    final roomId = gameSession.roomId;
+    final playerName = widget.currentPlayerName;
+
+    if (!wsService.isConnected) {
+      wsService.connect().then((_) {
+        if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
+          wsService.joinRoom(roomId, playerName).catchError((error) {
+            print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
+          });
+        }
+      }).catchError((error) {
+        print('⚠️ Impossible de se connecter au WebSocket: $error');
+        if (mounted) _restartRoomSyncPolling(forceRestart: true);
+      });
+    } else if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
+      wsService.joinRoom(roomId, playerName).catchError((error) {
+        print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
+      });
+    }
+  }
 
   /// Méthode utilitaire pour ajouter un log de débogage (pour l'UI et la console)
   void _addDebugLog(String log) {
@@ -3120,18 +3152,20 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     roomPollTimer = null;
     stateSyncTimer?.cancel();
 
-    final myCardsMissing =
-        cardManager.getPlayerCards(widget.currentPlayerName).isEmpty;
+    final cardsReceived =
+        cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty;
 
-    final interval = myCardsMissing && !waitingForHumans
-        ? const Duration(seconds: 3)
-        : GameRoomPollingPolicy.roomSyncInterval(
-            webSocketConnected: isWebSocketConnected,
-            waitingForPlayers: waitingForHumans,
-            announcementPhase: cardManager.isAnnouncementPhase,
-          );
+    final interval = GameRoomPollingPolicy.roomSyncInterval(
+      webSocketConnected: isWebSocketConnected,
+      waitingForPlayers: waitingForHumans,
+      announcementPhase: cardManager.isAnnouncementPhase,
+      cardsReceived: cardsReceived,
+    );
 
     stateSyncTimer = Timer.periodic(interval, (_) => _pollGameState());
+    print(
+      '🔁 Polling HTTP (${interval.inSeconds}s) — WS=${isWebSocketConnected ? 'ON' : 'OFF'}',
+    );
   }
 
   void _startRoomPolling() => _restartRoomSyncPolling(forceRestart: true);
@@ -3142,14 +3176,15 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   Future<void> _pollGameState() async {
     if (!mounted || gameSession.playWithBots) return;
 
-    final myCardsMissing =
-        cardManager.getPlayerCards(widget.currentPlayerName).isEmpty;
+    final cardsReceived =
+        cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty;
 
-    if (!myCardsMissing &&
-        GameRoomPollingPolicy.shouldSkipRoomSync(
-          webSocketConnected: isWebSocketConnected,
-          announcementPhase: cardManager.isAnnouncementPhase,
-        )) {
+    if (GameRoomPollingPolicy.shouldSkipRoomSync(
+      webSocketConnected: isWebSocketConnected,
+      announcementPhase: cardManager.isAnnouncementPhase,
+      waitingForPlayers: waitingForHumans,
+      cardsReceived: cardsReceived,
+    )) {
       return;
     }
 
@@ -3245,6 +3280,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   }
 
   void _applyDistributionFromSyncRound(Map<String, dynamic> round) {
+    if (isWebSocketConnected && !_forceSyncDistribution) {
+      return;
+    }
+
     final raw = round['distributed_cards'];
     if (raw is! Map || raw.isEmpty) return;
 

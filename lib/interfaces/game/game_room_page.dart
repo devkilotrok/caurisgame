@@ -1152,14 +1152,18 @@ class _GameRoomPageState extends State<GameRoomPage>
     _roomPollTimer = null;
     _stateSyncTimer?.cancel();
 
+    final cardsReceived =
+        _cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty;
+
     final interval = GameRoomPollingPolicy.roomSyncInterval(
       webSocketConnected: _isWebSocketConnected,
       waitingForPlayers: _waitingForHumans,
       announcementPhase: _cardManager.isAnnouncementPhase,
+      cardsReceived: cardsReceived,
     );
     _stateSyncTimer = Timer.periodic(interval, (_) => _pollGameState());
     print(
-      '🔁 Polling HTTP unifié (${interval.inSeconds}s) - WS=${_isWebSocketConnected ? 'ON' : 'OFF'}',
+      '🔁 Polling HTTP (${interval.inSeconds}s) — WS=${_isWebSocketConnected ? 'ON' : 'OFF'}',
     );
   }
 
@@ -1171,9 +1175,14 @@ class _GameRoomPageState extends State<GameRoomPage>
   Future<void> _pollGameState() async {
     if (!mounted || _gameSession.playWithBots) return;
 
+    final cardsReceived =
+        _cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty;
+
     if (GameRoomPollingPolicy.shouldSkipRoomSync(
       webSocketConnected: _isWebSocketConnected,
       announcementPhase: _cardManager.isAnnouncementPhase,
+      waitingForPlayers: _waitingForHumans,
+      cardsReceived: cardsReceived,
     )) {
       return;
     }
