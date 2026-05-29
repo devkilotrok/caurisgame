@@ -53,6 +53,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   int? _announcementPhaseRoundApplied;
   int? _distributionRoundApplied;
   bool _waitingForHumans = false;
+  bool _distributionRequestInFlight = false;
+  final Set<String> _wsJoinedPlayerNames = <String>{};
+  Map<String, dynamic>? _pendingAnnouncementPhasePayload;
   bool _isProcessingAnnouncementTurn = false;
   bool _isProcessingAnnouncementCompletion = false;
   String? _currentPlayerPlaying;
@@ -81,6 +84,78 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   StreamSubscription? _trickCompletedSubscription;
     StreamSubscription? _roundCompletedSubscription;
   StreamSubscription? _roundScoresUpdatedSubscription;
+  StreamSubscription? _playerJoinedSubscription;
+
+  bool _hasFullHttpRoom() {
+    return gameSession.players.length >= requiredPlayers;
+  }
+
+  bool _localPlayerHasCards() {
+    return cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty;
+  }
+
+  Set<String> _expectedHumanPlayerNames() {
+    return gameSession.players
+        .map((p) => (p['name'] as String?)?.trim() ?? '')
+        .where((n) => n.isNotEmpty)
+        .toSet();
+  }
+
+  bool _hasAllPlayersJoinedWebSocket() {
+    if (!_hasFullHttpRoom()) return false;
+    final expected = _expectedHumanPlayerNames();
+    if (expected.length < requiredPlayers) return false;
+    return expected.every(_wsJoinedPlayerNames.contains);
+  }
+
+  void _ingestWsPlayerJoinedPayload(dynamic data) {
+    if (data is! Map) return;
+    final payload = Map<String, dynamic>.from(data);
+    final joinedName = payload['playerName']?.toString().trim();
+    if (joinedName != null && joinedName.isNotEmpty) {
+      _wsJoinedPlayerNames.add(joinedName);
+    }
+    final players = payload['players'] as List?;
+    if (players != null) {
+      for (final player in players) {
+        if (player is Map && player['name'] != null) {
+          final name = player['name'].toString().trim();
+          if (name.isNotEmpty) {
+            _wsJoinedPlayerNames.add(name);
+          }
+        }
+      }
+    }
+    print(
+      '👥 WS room: ${_wsJoinedPlayerNames.length}/$requiredPlayers '
+      '(${_wsJoinedPlayerNames.join(", ")})',
+    );
+
+    if (!hasGameStarted &&
+        !_distributionRequestInFlight &&
+        _hasFullHttpRoom() &&
+        _hasAllPlayersJoinedWebSocket()) {
+      final isCreator = gameSession.players.any(
+        (p) =>
+            (p['name'] as String?) == widget.currentPlayerName &&
+            (p['isCreator'] as bool?) == true,
+      );
+      if (isCreator) {
+        print('👑 Tous les joueurs WS présents — lancement distribution');
+        unawaited(_creatorRequestDistributionWhenReady());
+      }
+    }
+  }
+
+  void _maybeApplyPendingAnnouncementPhase() {
+    if (_pendingAnnouncementPhasePayload == null || !_localPlayerHasCards()) {
+      return;
+    }
+    final pending = _pendingAnnouncementPhasePayload!;
+    _pendingAnnouncementPhasePayload = null;
+    print('▶️ Application différée de la phase d\'annonces (cartes reçues)');
+    _applyAnnouncementPhaseStartedNow(pending);
+  }
 
   /// Numéro de manche côté serveur (évite currentRound=0 au premier round).
   void _syncRoundNumber(int? roundNumber) {
@@ -685,6 +760,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     _countersSyncTimer?.cancel(); // ✅ Annuler le timer de synchronisation des compteurs
     _cancelDistributionSyncFallback();
 
+    _playerJoinedSubscription?.cancel();
     wsConnectSubscription?.cancel();
     wsDisconnectSubscription?.cancel();
     wsErrorSubscription?.cancel();
@@ -1137,6 +1213,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       if (effectivePlayerNames.length < requiredPlayers) {
         waitingForHumans = true;
         setState(() {});
+        print(
+          '⏳ Distribution reportée: ${effectivePlayerNames.length}/$requiredPlayers '
+          'joueurs HTTP dans la salle',
+        );
         return;
       }
 
@@ -1150,71 +1230,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       );
 
       if (isCreator) {
-        // ✅ LE CRÉATEUR demande au backend de distribuer les cartes
-        // Le backend gère le mélange et envoie la distribution via WebSocket
-        print('👑 Créateur: demande de distribution des cartes au backend...');
-        
-        final roomId = gameSession.roomId ?? '';
-        if (roomId.isEmpty) {
-          print('❌ Room ID manquant, impossible de distribuer');
-          return;
-        }
-        
-        try {
-          // ✅ Utiliser la liste mise à jour des joueurs (après ajout des bots si nécessaire)
-          final finalPlayerNames = gameSession.players
-              .map((player) => player['name'] as String? ?? 'Joueur')
-              .where((n) => n.isNotEmpty)
-              .toList();
-          
-          print('📊 Distribution des cartes pour ${finalPlayerNames.length} joueurs: ${finalPlayerNames.join(", ")}');
-          
-          if (_useTestDistribution) {
-            print('🧪 Mode test: distribution forcée à 13 cartes fixes');
-          }
-          // ✅ Appeler l'API backend pour distribuer les cartes
-          await GameApiService.instance.distributeCards(
-            roomId: roomId,
-            roundNumber: gameSession.currentRound + 1,
-            testMode: _useTestDistribution,
-          ).then((response) {
-            print('✅ Backend a distribué les cartes: $response');
-            // Secours HTTP si WebSocket en retard (timeout Render, join_room manqué)
-            _applyGameStateFromDistributeCardsResponse(response);
-          }).catchError((e) {
-            print('❌ Erreur lors de la demande de distribution: $e');
-            print('❌ ERREUR CRITIQUE: Le backend n\'a pas pu distribuer les cartes');
-            print('   La distribution locale est DÉSACTIVÉE - seul le backend peut distribuer');
-            // ❌ NE PLUS FAIRE DE FALLBACK LOCAL - Le backend est la seule source de vérité
-            // Afficher un message d'erreur à l'utilisateur
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: const Text('Erreur: Impossible de distribuer les cartes. Veuillez réessayer.'),
-                  backgroundColor: Colors.red,
-                  duration: const Duration(seconds: 5),
-                  behavior: SnackBarBehavior.floating,
-                  margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                ),
-              );
-            }
-          });
-        } catch (e) {
-          print('❌ Exception lors de la demande de distribution: $e');
-          print('❌ ERREUR CRITIQUE: Exception lors de la distribution');
-          print('   La distribution locale est DÉSACTIVÉE - seul le backend peut distribuer');
-          // ❌ NE PLUS FAIRE DE FALLBACK LOCAL
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Erreur: Impossible de distribuer les cartes. Veuillez réessayer.'),
-                backgroundColor: Colors.red,
-                duration: Duration(seconds: 5),
-              ),
-            );
-          }
-        }
+        await _creatorRequestDistributionWhenReady();
       } else {
         print('⏳ En attente de la distribution via WebSocket...');
         _scheduleDistributionSyncFallback();
@@ -1222,6 +1238,99 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       }
     } catch (e) {
       print('❌ Erreur distribution: $e');
+    }
+  }
+
+  Future<void> _creatorRequestDistributionWhenReady() async {
+    if (_distributionRequestInFlight || !mounted) return;
+
+    final roomId = gameSession.roomId ?? '';
+    if (roomId.isEmpty) {
+      print('❌ Room ID manquant, impossible de distribuer');
+      return;
+    }
+
+    _distributionRequestInFlight = true;
+    print(
+      '👑 Créateur: attente de $requiredPlayers joueurs (HTTP + WebSocket)...',
+    );
+
+    try {
+      for (var attempt = 0; attempt < 45 && mounted; attempt++) {
+        if (!_hasFullHttpRoom()) {
+          print(
+            '⏳ HTTP: ${gameSession.players.length}/$requiredPlayers joueurs',
+          );
+          await Future.delayed(const Duration(seconds: 2));
+          continue;
+        }
+
+        if (!_hasAllPlayersJoinedWebSocket()) {
+          final expected = _expectedHumanPlayerNames();
+          final missing = expected.difference(_wsJoinedPlayerNames);
+          print(
+            '⏳ WS: ${_wsJoinedPlayerNames.length}/$requiredPlayers connectés'
+            '${missing.isEmpty ? '' : ' — manque: ${missing.join(", ")}'}',
+          );
+          await Future.delayed(const Duration(seconds: 2));
+          continue;
+        }
+
+        print(
+          '👑 Salle prête (${gameSession.players.length} HTTP, '
+          '${_wsJoinedPlayerNames.length} WS) — distribution...',
+        );
+
+        try {
+          final response = await GameApiService.instance.distributeCards(
+            roomId: roomId,
+            roundNumber: gameSession.currentRound + 1,
+            testMode: _useTestDistribution,
+          );
+          print('✅ Backend a distribué les cartes: $response');
+          _applyGameStateFromDistributeCardsResponse(response);
+          return;
+        } catch (e) {
+          final message = e.toString();
+          if (message.contains('409') ||
+              message.contains('ROOM_NOT_READY') ||
+              message.contains('ROOM_NOT_FULL')) {
+            print('⚠️ Backend: salle pas prête ($message) — retry...');
+            await Future.delayed(const Duration(seconds: 2));
+            continue;
+          }
+          print('❌ Erreur lors de la demande de distribution: $e');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'Erreur: Impossible de distribuer les cartes. Veuillez réessayer.',
+                ),
+                backgroundColor: Colors.red,
+                duration: Duration(seconds: 5),
+              ),
+            );
+          }
+          return;
+        }
+      }
+
+      print(
+        '❌ Timeout: distribution impossible — tous les joueurs ne sont pas prêts',
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'En attente des $requiredPlayers joueurs connectés au WebSocket...',
+            ),
+            backgroundColor: Colors.orange,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    } finally {
+      _distributionRequestInFlight = false;
     }
   }
 
@@ -1305,13 +1414,28 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     if (skipConfigureIfAnnouncementActive && cardManager.isAnnouncementPhase) {
       print('ℹ️ Cartes appliquées — phase d\'annonces déjà active');
+      _maybeApplyPendingAnnouncementPhase();
       return;
     }
 
     _configureGameAfterDistribution(playerNames);
+    _maybeApplyPendingAnnouncementPhase();
   }
 
   void _handleAnnouncementPhaseStartedPayload(Map<String, dynamic> data) {
+    if (!_localPlayerHasCards()) {
+      _pendingAnnouncementPhasePayload = Map<String, dynamic>.from(data);
+      print(
+        '⏸️ Phase d\'annonces différée — cartes manquantes pour '
+        '${widget.currentPlayerName}',
+      );
+      unawaited(_ensureMyCardsFromSyncIfMissing());
+      return;
+    }
+    _applyAnnouncementPhaseStartedNow(data);
+  }
+
+  void _applyAnnouncementPhaseStartedNow(Map<String, dynamic> data) {
     final roomId = data['roomId'] as String? ?? data['room_id']?.toString();
     final roundNumber = (data['round_number'] as num?)?.toInt();
     final startTimestamp = (data['start_timestamp'] as num?)?.toInt();
@@ -1356,9 +1480,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       });
     }
     _restartRoomSyncPolling(forceRestart: true);
-    if (cardManager.getPlayerCards(widget.currentPlayerName).isEmpty) {
-      _ensureMyCardsFromSyncIfMissing();
-    }
     _scheduleBotAnnouncementsAfterPhaseStart();
   }
 
@@ -1564,6 +1685,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       });
       final roomId = gameSession.roomId;
       final playerName = widget.currentPlayerName;
+      if (playerName.isNotEmpty) {
+        _wsJoinedPlayerNames.add(playerName);
+      }
       if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
         wsService.joinRoom(roomId, playerName).catchError((error) {
           print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
@@ -1574,6 +1698,11 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       if (!waitingForHumans) {
         _ensureMyCardsFromSyncIfMissing();
       }
+    });
+
+    _playerJoinedSubscription = wsService.onPlayerJoined().listen((data) {
+      if (!mounted) return;
+      _ingestWsPlayerJoinedPayload(data);
     });
 
     wsDisconnectSubscription = wsService.onDisconnect().listen((_) {
@@ -1707,8 +1836,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             roomId == gameSession.roomId) {
           print('📡 Annonce reçue via WebSocket: $playerName → $announcement plis');
 
-          if (cardManager.getPlayerCards(widget.currentPlayerName).isEmpty) {
+          if (!_localPlayerHasCards()) {
+            print('⏸️ Annonce ignorée — cartes manquantes');
             unawaited(_ensureMyCardsFromSyncIfMissing());
+            return;
           }
           
           // ✅ Vérifier si l'annonce n'existe pas déjà (éviter les doublons)
@@ -3245,7 +3376,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       _applyDistributionFromSyncRound(round);
 
       final status = round['status'] as String?;
-      if (status == 'ANNOUNCEMENT_PHASE' && !cardManager.isAnnouncementPhase) {
+      if (status == 'ANNOUNCEMENT_PHASE' &&
+          !cardManager.isAnnouncementPhase &&
+          _localPlayerHasCards()) {
         final startTs =
             (DateTime.now().millisecondsSinceEpoch ~/ 1000) -
             (30 - ((round['announcement_seconds_remaining'] as num?)?.toInt() ?? 30));
@@ -3265,7 +3398,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     final status = round['status'] as String?;
     final announcements = round['announcements'] as Map<String, dynamic>?;
-    if (status == 'ANNOUNCEMENT_PHASE' && announcements != null) {
+    if (status == 'ANNOUNCEMENT_PHASE' &&
+        announcements != null &&
+        _localPlayerHasCards()) {
       for (final entry in announcements.entries) {
         final playerName = entry.key;
         final value = (entry.value as num?)?.toInt() ?? 0;
@@ -3307,6 +3442,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       roundNumber: roundNumber,
       skipConfigureIfAnnouncementActive: cardManager.isAnnouncementPhase,
     );
+    _maybeApplyPendingAnnouncementPhase();
   }
 
   void _ingestChatFromSync(Map<String, dynamic> chat) {
@@ -3431,10 +3567,20 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       });
     }
 
-    if (startGameIfReady && normalized.length >= requiredPlayers && !hasGameStarted) {
+    if (startGameIfReady &&
+        normalized.length >= requiredPlayers &&
+        !hasGameStarted &&
+        _hasAllPlayersJoinedWebSocket()) {
       waitingForHumans = false;
       _restartRoomSyncPolling(forceRestart: true);
       startCardDistribution();
+    } else if (startGameIfReady &&
+        normalized.length >= requiredPlayers &&
+        !hasGameStarted) {
+      print(
+        '⏳ ${normalized.length}/$requiredPlayers joueurs HTTP — '
+        'attente WS (${_wsJoinedPlayerNames.length}/$requiredPlayers)',
+      );
     }
   }
 
