@@ -286,10 +286,120 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     return a.toString() == b.toString();
   }
 
+  bool _announcementCompletionCheckInFlight = false;
+
   bool _matchesRoundNumber(int? roundNumber) {
     if (roundNumber == null || roundNumber < 1) return false;
     if (gameSession.currentRound < 1) return true;
     return roundNumber == gameSession.currentRound;
+  }
+
+  /// Démarre la phase de jeu quand le backend confirme que toutes les annonces sont faites.
+  Future<void> _completeAnnouncementPhaseFromBackend({
+    Map<String, dynamic>? announcements,
+    String? firstPlayer,
+    int? roundNumber,
+    required String source,
+  }) async {
+    if (!mounted || !cardManager.isAnnouncementPhase) return;
+    if (_isProcessingAnnouncementCompletion) {
+      print('ℹ️ Fin phase annonces ignorée ($source): déjà en cours');
+      return;
+    }
+
+    print('✅ Fin phase annonces via $source');
+
+    _announcementPhaseTimer?.cancel();
+    _announcementPhaseStartTimestamp = null;
+
+    if (roundNumber != null) {
+      _syncRoundNumber(roundNumber);
+    }
+
+    if (announcements != null && announcements.isNotEmpty) {
+      final players = gameSession.players
+          .map((p) => p['name'] as String? ?? 'Joueur')
+          .toList();
+
+      for (final entry in announcements.entries) {
+        final playerName = entry.key.toString();
+        final announcement = (entry.value as num?)?.toInt() ?? 0;
+        final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
+        if (!existingAnnouncements.any((ann) => ann['player'] == playerName)) {
+          cardManager.makeAnnouncement(playerName, announcement);
+        }
+      }
+
+      final announcementsList = <int>[];
+      for (final playerName in players) {
+        announcementsList.add(
+          (announcements[playerName] as num?)?.toInt() ?? 0,
+        );
+      }
+      if (announcementsList.length == players.length) {
+        gameSession.addCurrentRound(announcementsList);
+      }
+    }
+
+    if (mounted) setState(() {});
+
+    await handleAnnouncementTurnComplete();
+    _restartRoomSyncPolling(forceRestart: true);
+
+    if (firstPlayer != null && firstPlayer.isNotEmpty && mounted) {
+      Future.delayed(const Duration(milliseconds: 100), () {
+        if (mounted && !cardManager.isAnnouncementPhase) {
+          cardManager.currentPlayerTurn = firstPlayer;
+          setState(() {});
+          startPlayerTurnTimeout();
+          Future.delayed(const Duration(milliseconds: 500), () {
+            if (mounted && !cardManager.isAnnouncementPhase) {
+              maybeAutoPlayCurrentBot();
+            }
+          });
+        }
+      });
+    }
+  }
+
+  /// Secours HTTP si announcements_complete WS n'arrive pas.
+  Future<void> _tryCompleteAnnouncementPhaseFromBackend({
+    required String reason,
+  }) async {
+    if (!mounted || !cardManager.isAnnouncementPhase) return;
+    if (_announcementCompletionCheckInFlight) return;
+
+    _announcementCompletionCheckInFlight = true;
+    try {
+      final gameId = await _resolveGameId();
+      if (gameId == null) return;
+
+      final turnData = await GameApiService.instance.getAnnouncementTurn(
+        gameId: gameId,
+        roundNumber: _effectiveRoundNumber(),
+      );
+
+      if (turnData['all_announced'] != true) {
+        print('ℹ️ Secours annonces ($reason): BDD pas encore complète');
+        return;
+      }
+
+      final announcementsRaw = turnData['announcements'];
+      Map<String, dynamic>? announcementsMap;
+      if (announcementsRaw is Map) {
+        announcementsMap = Map<String, dynamic>.from(announcementsRaw);
+      }
+
+      await _completeAnnouncementPhaseFromBackend(
+        announcements: announcementsMap,
+        roundNumber: _effectiveRoundNumber(),
+        source: 'getAnnouncementTurn/$reason',
+      );
+    } catch (e) {
+      print('⚠️ Secours annonces ($reason): $e');
+    } finally {
+      _announcementCompletionCheckInFlight = false;
+    }
   }
 
   Future<int?> _resolveGameId() async {
@@ -1873,34 +1983,12 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             print('⚠️ Annonce déjà existante pour $playerName, ignorée');
           }
           
-          // ✅ NOUVEAU: Vérifier avec le backend si toutes les annonces sont faites
-          try {
-            final gameId = await getGameId();
-            final roundNumber = gameSession.currentRound;
-            
-            if (gameId != null) {
-              final turnData = await GameApiService.instance.getAnnouncementTurn(
-                gameId: gameId,
-                roundNumber: _effectiveRoundNumber(),
-              );
-              
-              if (turnData['all_announced'] == true) {
-                print('✅ Toutes les annonces sont terminées (backend), passage à la phase de jeu');
-                super.handleAnnouncementTurnComplete();
-                return;
-              }
-            }
-          } catch (e) {
-            print('⚠️ Erreur lors de la vérification du tour depuis le backend: $e');
-            // Fallback: vérification locale
-            final playerNames = gameSession.players
-                .map((player) => player['name'] as String? ?? 'Joueur')
-                .toList();
-            if (cardManager.areAllAnnouncementsDone(playerNames)) {
-              print('✅ Toutes les annonces sont terminées (local), passage à la phase de jeu');
-              super.handleAnnouncementTurnComplete();
-            }
-          }
+          // ✅ Vérifier avec le backend si toutes les annonces sont faites
+          unawaited(
+            _tryCompleteAnnouncementPhaseFromBackend(
+              reason: 'announcement_made',
+            ),
+          );
         } else {
           print('⚠️ Annonce reçue mais conditions non remplies:');
           if (playerName == null) print('      - playerName est null');
@@ -1984,6 +2072,20 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             setState(() {});
           }
         }
+
+        final playerNames = gameSession.players
+            .map((p) => p['name'] as String? ?? 'Joueur')
+            .toList();
+        final allLocal = cardManager.areAllAnnouncementsDone(playerNames);
+        final allSubmitted =
+            submittedCount != null && submittedCount >= requiredPlayers;
+        if (allLocal || allSubmitted) {
+          unawaited(
+            _tryCompleteAnnouncementPhaseFromBackend(
+              reason: 'announcement_submitted',
+            ),
+          );
+        }
       }
     });
 
@@ -2013,155 +2115,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       print('   - Match total: ${roomIdMatch && roundNumberMatch}');
       
       if (roomIdMatch && roundNumberMatch) {
-        _syncRoundNumber(roundNumber);
-        print('✅ Toutes les annonces sont terminées (système simultané)');
-        print('   - Annonces: $announcements');
-        print('   - Premier joueur: $firstPlayer');
-        
-        // Arrêter le timer de la phase
-        _announcementPhaseTimer?.cancel();
-        _announcementPhaseStartTimestamp = null;
-        _currentGameId = null; // ✅ Réinitialiser le game_id
-        
-        // Synchroniser les annonces depuis le backend
-        if (announcements != null) {
-          final players = gameSession.players
-              .map((p) => p['name'] as String? ?? 'Joueur')
-              .toList();
-          
-          // ✅ Construire la liste des annonces dans l'ordre des joueurs pour gameSession
-          final announcementsList = <int>[];
-          
-          for (final entry in announcements.entries) {
-            final playerName = entry.key as String;
-            final announcement = (entry.value as num?)?.toInt() ?? 0;
-            
-            // Vérifier si l'annonce n'existe pas déjà
-            final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
-            final alreadyExists = existingAnnouncements.any(
-              (ann) => ann['player'] == playerName,
-            );
-            
-            if (!alreadyExists) {
-              print('   - Ajout annonce: $playerName → $announcement');
-              cardManager.makeAnnouncement(playerName, announcement);
-            } else {
-              print('   - Annonce déjà existante: $playerName → $announcement');
-            }
-          }
-          
-          // ✅ CRITIQUE: Mettre à jour gameSession.roundsData pour afficher la ligne R1 dans le tableau
-          // Construire la liste des annonces dans l'ordre des joueurs
-          for (final playerName in players) {
-            final announcement = (announcements[playerName] as num?)?.toInt() ?? 0;
-            announcementsList.add(announcement);
-          }
-          
-          // ✅ Ajouter le round actuel dans gameSession pour qu'il apparaisse dans le tableau de scores
-          // IMPORTANT: Utiliser addCurrentRound() pour ne PAS incrémenter currentRound
-          // car on doit rester au round actuel pour jouer les cartes
-          if (announcementsList.length == players.length) {
-            print('   - Ajout du round ${gameSession.currentRound} dans gameSession avec annonces: $announcementsList');
-            gameSession.addCurrentRound(announcementsList);
-            
-            // ✅ Forcer la mise à jour de l'UI pour que le tableau de scores soit visible
-            if (mounted) {
-              setState(() {
-                // Le tableau de scores sera mis à jour automatiquement via gameSession.roundsData
-              });
-            }
-          }
-        }
-        
-        // ✅ CORRECTION: Ne PAS mettre isAnnouncementPhase = false ici
-        // handleAnnouncementTurnComplete() doit le faire via startGamePhase()
-        // pour que la vérification dans handleAnnouncementTurnComplete() fonctionne
-        
-        // ✅ Stocker le firstPlayer du backend pour l'utiliser dans handleAnnouncementTurnComplete()
-        // On va le passer via une variable de classe ou directement dans la méthode
-        final backendFirstPlayer = firstPlayer;
-        
-        // ✅ Démarrer le jeu - handleAnnouncementTurnComplete() va :
-        // 1. Vérifier que isAnnouncementPhase est true
-        // 2. Appeler startGamePhase() qui met isAnnouncementPhase = false
-        // 3. Définir le premier joueur pour la phase de jeu
-        print('   - Appel handleAnnouncementTurnComplete() avec firstPlayer: $backendFirstPlayer');
-        
-        // ✅ CORRECTION: L'événement announcements_complete du backend garantit que toutes les annonces sont faites
-        // On peut donc forcer le démarrage de la phase de jeu même si areAllAnnouncementsDone() retourne false
-        // (cela peut arriver si la synchronisation locale n'est pas encore complète)
-        
-        final playerNames = gameSession.players
-            .map((p) => p['name'] as String? ?? 'Joueur')
-            .toList();
-        
-        // ✅ DEBUG: Vérifier l'état des annonces
-        final currentAnnouncements = cardManager.getCurrentRoundAnnouncements();
-        print('🔍 Vérification annonces avant démarrage phase de jeu:');
-        print('   - Nombre d\'annonces locales: ${currentAnnouncements.length}');
-        print('   - Nombre de joueurs: ${playerNames.length}');
-        for (final playerName in playerNames) {
-          final hasAnnounced = currentAnnouncements.any((ann) => ann['player'] == playerName);
-          final announcement = currentAnnouncements.firstWhere(
-            (ann) => ann['player'] == playerName,
-            orElse: () => <String, Object>{'announcement': 0},
-          )['announcement'] as int? ?? 0;
-          print('   - $playerName: ${hasAnnounced ? "✅ $announcement plis" : "❌ pas d\'annonce"}');
-        }
-        
-        // ✅ S'assurer que toutes les annonces du backend sont bien synchronisées localement
-        if (announcements != null) {
-          for (final entry in announcements.entries) {
-            final playerName = entry.key as String;
-            final announcement = (entry.value as num?)?.toInt() ?? 0;
-            final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
-            final alreadyExists = existingAnnouncements.any(
-              (ann) => ann['player'] == playerName,
-            );
-            if (!alreadyExists) {
-              print('   - Synchronisation manquante: ajout annonce $playerName → $announcement');
-              cardManager.makeAnnouncement(playerName, announcement);
-            }
-          }
-        }
-        
-        // ✅ Maintenant vérifier que toutes les annonces sont bien là
-        final allAnnounced = cardManager.areAllAnnouncementsDone(playerNames);
-        print('   - Toutes les annonces sont faites (après synchronisation): $allAnnounced');
-        
-        // ✅ Démarrer la phase de jeu - l'événement backend garantit que c'est le bon moment
-        print('✅ Démarrage de la phase de jeu (événement backend announcements_complete)');
-        
-        // ✅ Forcer le démarrage même si areAllAnnouncementsDone() retourne false
-        // car l'événement backend est la source de vérité
-        if (!allAnnounced) {
-          print('⚠️ areAllAnnouncementsDone() retourne false, mais l\'événement backend garantit que toutes les annonces sont faites');
-          print('   - Forçage du démarrage de la phase de jeu');
-        }
-        
-        super.handleAnnouncementTurnComplete();
-        _restartRoomSyncPolling(forceRestart: true);
-
-        // ✅ Après handleAnnouncementTurnComplete(), utiliser le firstPlayer du backend si disponible
-        if (backendFirstPlayer != null && backendFirstPlayer.isNotEmpty && mounted) {
-          Future.delayed(const Duration(milliseconds: 100), () {
-            if (mounted && !cardManager.isAnnouncementPhase) {
-              print('   - Utilisation du premier joueur du backend: $backendFirstPlayer');
-              cardManager.currentPlayerTurn = backendFirstPlayer;
-              setState(() {});
-              
-              // ✅ Démarrer le timer de timeout et le jeu automatique des bots
-              startPlayerTurnTimeout();
-              Future.delayed(const Duration(milliseconds: 500), () {
-                if (mounted && !cardManager.isAnnouncementPhase) {
-                  maybeAutoPlayCurrentBot();
-                }
-              });
-            }
-          });
-        }
-        
-        print('✅ Phase d\'annonces terminée, jeu démarré');
+        unawaited(_completeAnnouncementPhaseFromBackend(
+          announcements: announcements != null
+              ? Map<String, dynamic>.from(announcements)
+              : null,
+          firstPlayer: firstPlayer,
+          roundNumber: roundNumber,
+          source: 'announcements_complete_ws',
+        ));
       } else {
         print('⚠️ Événement announcements_complete ignoré (roomId ou roundNumber ne correspondent pas)');
       }
@@ -3387,6 +3348,20 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           'start_timestamp': startTs,
           'duration': 30,
         });
+      }
+
+      // Secours : BDD en PLAYING mais client encore en phase d'annonces (WS manqué)
+      if (cardManager.isAnnouncementPhase && status == 'PLAYING') {
+        final announcementsRaw = round['announcements'];
+        Map<String, dynamic>? announcementsMap;
+        if (announcementsRaw is Map) {
+          announcementsMap = Map<String, dynamic>.from(announcementsRaw);
+        }
+        unawaited(_completeAnnouncementPhaseFromBackend(
+          announcements: announcementsMap,
+          roundNumber: (round['round_number'] as num?)?.toInt(),
+          source: 'sync_playing_status',
+        ));
       }
     }
 
@@ -5569,13 +5544,29 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       print('✅ Validation OK: gameId=$gameId, roundNumber=$roundNumber, announcementValue=$clampedAnnouncement');
       
       // ✅ Envoyer l'annonce au backend (système simultané)
-      await GameApiService.instance.makeAnnouncement(
+      final response = await GameApiService.instance.makeAnnouncement(
         gameId: gameId,
         roundNumber: roundNumber,
         announcementValue: clampedAnnouncement,
       );
       
       print('✅ Annonce envoyée au backend avec succès');
+
+      final responseData = response['data'];
+      if (responseData is Map && responseData['is_complete'] == true) {
+        final announcementsRaw = responseData['announcements'];
+        Map<String, dynamic>? announcementsMap;
+        if (announcementsRaw is Map) {
+          announcementsMap = Map<String, dynamic>.from(announcementsRaw);
+        }
+        await _completeAnnouncementPhaseFromBackend(
+          announcements: announcementsMap,
+          firstPlayer: responseData['first_player'] as String?,
+          roundNumber: (responseData['round_number'] as num?)?.toInt() ??
+              roundNumber,
+          source: 'announce_http_response',
+        );
+      }
       
       // ✅ Mettre à jour l'état local (l'annonce sera aussi reçue via WebSocket)
       if (mounted) {
@@ -5834,6 +5825,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         }
       }
     }
+
+    await _tryCompleteAnnouncementPhaseFromBackend(reason: 'phase_timeout');
   }
 
   void _forceAnnouncementForPlayer(String playerName, int announcement) {

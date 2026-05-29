@@ -17,7 +17,11 @@ class GameRoomPollingPolicy {
     required bool cardsReceived,
   }) {
     if (webSocketConnected) {
-      if (cardsReceived && (announcementPhase || !waitingForPlayers)) {
+      // Phase d'annonces : polling de secours même si WS connecté (fin de phase manquée)
+      if (announcementPhase && cardsReceived) {
+        return const Duration(seconds: 8);
+      }
+      if (cardsReceived && !waitingForPlayers) {
         return const Duration(seconds: 60);
       }
       if (waitingForPlayers) {
@@ -52,6 +56,8 @@ class GameRoomPollingPolicy {
     if (!webSocketConnected) return false;
     if (waitingForPlayers) return false;
     if (!cardsReceived) return false;
+    // Secours : vérifier /sync pendant les annonces si le WS a manqué announcements_complete
+    if (announcementPhase) return false;
     return true;
   }
 }
