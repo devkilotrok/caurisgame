@@ -70,7 +70,7 @@ class GameWebSocketService {
             _currentPlayerName != null &&
             _currentPlayerName!.isNotEmpty) {
           _emit('join_room', {
-            'roomId': _currentRoomId,
+            'roomId': _currentRoomId.toString(),
             'playerName': _currentPlayerName,
           });
         }
@@ -183,7 +183,7 @@ class GameWebSocketService {
     }
 
     await _emit('join_room', {
-      'roomId': roomId,
+      'roomId': roomId.toString(),
       'playerName': playerName,
     });
   }

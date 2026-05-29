@@ -6,7 +6,8 @@ class GameRoomPollingPolicy {
   GameRoomPollingPolicy._();
 
   /// Délai avant un secours HTTP si les cartes n'arrivent pas via WebSocket.
-  static const Duration distributionFallbackDelay = Duration(seconds: 12);
+  static const Duration distributionFallbackDelay = Duration(seconds: 5);
+  static const Duration distributionFirstRetryDelay = Duration(milliseconds: 800);
 
   /// Un seul GET /rooms/{id}/sync (fusion ancien room + state sync).
   static Duration roomSyncInterval({

@@ -100,6 +100,12 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     return gameSession.currentRound > 0 ? gameSession.currentRound : 1;
   }
 
+
+  bool _roomIdsMatch(Object? a, Object? b) {
+    if (a == null || b == null) return false;
+    return a.toString() == b.toString();
+  }
+
   bool _matchesRoundNumber(int? roundNumber) {
     if (roundNumber == null || roundNumber < 1) return false;
     if (gameSession.currentRound < 1) return true;
@@ -128,20 +134,41 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     _distributionFallbackTimer = null;
   }
 
+  Future<void> _ensureMyCardsFromSyncIfMissing() async {
+    if (!mounted || gameSession.playWithBots) return;
+    if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) return;
+    await _pullDistributionFromSync();
+  }
+
   void _scheduleDistributionSyncFallback() {
     _cancelDistributionSyncFallback();
     _distributionFallbackTimer = Timer(
-      GameRoomPollingPolicy.distributionFallbackDelay,
+      GameRoomPollingPolicy.distributionFirstRetryDelay,
       () async {
         if (!mounted) return;
         if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
           return;
         }
-        print(
-          '⚠️ Pas de cartes via WebSocket après '
-          '${GameRoomPollingPolicy.distributionFallbackDelay.inSeconds}s — secours /sync',
-        );
+        print('⚠️ Secours /sync (1ère tentative, WS a peut-être manqué card_distribution)');
         await _pullDistributionFromSync();
+        if (!mounted) return;
+        if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
+          return;
+        }
+        _distributionFallbackTimer = Timer(
+          GameRoomPollingPolicy.distributionFallbackDelay,
+          () async {
+            if (!mounted) return;
+            if (cardManager.getPlayerCards(widget.currentPlayerName).isNotEmpty) {
+              return;
+            }
+            print(
+              '⚠️ Secours /sync (2e tentative après '
+              '${GameRoomPollingPolicy.distributionFallbackDelay.inSeconds}s)',
+            );
+            await _pullDistributionFromSync();
+          },
+        );
       },
     );
   }
@@ -1163,7 +1190,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     if (roomId != null &&
         gameSession.roomId != null &&
-        roomId != gameSession.roomId) {
+        !_roomIdsMatch(roomId, gameSession.roomId)) {
       return;
     }
     if (startTimestamp == null) return;
@@ -1197,6 +1224,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       });
     }
     _restartRoomSyncPolling(forceRestart: true);
+    if (cardManager.getPlayerCards(widget.currentPlayerName).isEmpty) {
+      _ensureMyCardsFromSyncIfMissing();
+    }
     _scheduleBotAnnouncementsAfterPhaseStart();
   }
 
@@ -1409,6 +1439,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       }
       _countersSyncTimer?.cancel();
       _restartRoomSyncPolling(forceRestart: true);
+      if (!waitingForHumans) {
+        _ensureMyCardsFromSyncIfMissing();
+      }
     });
 
     wsDisconnectSubscription = wsService.onDisconnect().listen((_) {
@@ -1442,7 +1475,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         return;
       }
       
-      if (roomId != null && roomId != gameSession.roomId) {
+      if (roomId != null && !_roomIdsMatch(roomId, gameSession.roomId)) {
         print('⚠️ Room ID ne correspond pas: $roomId vs ${gameSession.roomId}');
         return;
       }
@@ -3277,10 +3310,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   }
 
   void _applyDistributionFromSyncRound(Map<String, dynamic> round) {
-    if (isWebSocketConnected && !_forceSyncDistribution) {
-      return;
-    }
-
     final raw = round['distributed_cards'];
     if (raw is! Map || raw.isEmpty) return;
 
