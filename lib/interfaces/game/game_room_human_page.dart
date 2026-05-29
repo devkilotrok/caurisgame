@@ -128,7 +128,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     _distributionFallbackTimer = null;
   }
 
-  /// Secours HTTP uniquement si le WebSocket n'a pas livré les cartes à temps.
   void _scheduleDistributionSyncFallback() {
     _cancelDistributionSyncFallback();
     _distributionFallbackTimer = Timer(
@@ -1431,9 +1430,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     // ✅ NOUVEAU: Écouter la distribution de cartes
     _cardDistributionSubscription = wsService.onCardDistribution().listen((data) {
       if (!mounted) return;
-
+      
       print('📥 Événement card_distribution reçu via WebSocket: $data');
-
+      
       final distribution = data['distribution'] as Map<String, dynamic>?;
       final roundNumber = (data['round_number'] as num?)?.toInt();
       final roomId = (data['roomId'] ?? data['room_id'])?.toString();
@@ -2115,31 +2114,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         }
       }
     });
-
-    setState(() {
-      isWebSocketConnected = wsService.isConnected;
-    });
-
-    final roomId = gameSession.roomId;
-    final playerName = widget.currentPlayerName;
-
-    if (!wsService.isConnected) {
-      wsService.connect().then((_) {
-        if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
-          wsService.joinRoom(roomId, playerName).catchError((error) {
-            print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
-          });
-        }
-      }).catchError((error) {
-        print('⚠️ Impossible de se connecter au WebSocket: $error');
-        if (mounted) _restartRoomSyncPolling(forceRestart: true);
-      });
-    } else if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
-      wsService.joinRoom(roomId, playerName).catchError((error) {
-        print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
-      });
-    }
-  }
 
   /// Méthode utilitaire pour ajouter un log de débogage (pour l'UI et la console)
   void _addDebugLog(String log) {
@@ -3141,6 +3115,29 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         }
       }
     });
+    setState(() {
+      isWebSocketConnected = wsService.isConnected;
+    });
+
+    final roomId = gameSession.roomId;
+    final playerName = widget.currentPlayerName;
+
+    if (!wsService.isConnected) {
+      wsService.connect().then((_) {
+        if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
+          wsService.joinRoom(roomId, playerName).catchError((error) {
+            print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
+          });
+        }
+      }).catchError((error) {
+        print('⚠️ Impossible de se connecter au WebSocket: $error');
+        if (mounted) _restartRoomSyncPolling(forceRestart: true);
+      });
+    } else if (roomId != null && roomId.isNotEmpty && playerName.isNotEmpty) {
+      wsService.joinRoom(roomId, playerName).catchError((error) {
+        print('⚠️ Erreur lors de la jointure de la room WebSocket: $error');
+      });
+    }
   }
 
   /// Un seul timer HTTP pour la salle (remplace room + state sync doublons).
