@@ -327,6 +327,9 @@ class GameWebSocketService {
   
   /// ✅ NOUVEAU: S'abonner à la fin des annonces (système simultané)
   Stream<dynamic> onAnnouncementsComplete() => on('announcements_complete');
+
+  /// Ajustement backend : total des annonces < 10 → +1 par joueur
+  Stream<dynamic> onAnnouncementsAdjusted() => on('announcements_adjusted');
   
   /// S'abonner au démarrage du jeu
   Stream<dynamic> onGameStarted() => on('game_started');

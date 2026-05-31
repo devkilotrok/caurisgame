@@ -79,6 +79,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   StreamSubscription? _announcementPhaseStartedSubscription;
   StreamSubscription? _announcementSubmittedSubscription;
   StreamSubscription? _announcementsCompleteSubscription;
+  StreamSubscription? _announcementsAdjustedSubscription;
   StreamSubscription? _roomChatMessageSubscription;
   StreamSubscription? _cardPlayedSubscription;
   StreamSubscription? _trickCompletedSubscription;
@@ -299,6 +300,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     Map<String, dynamic>? announcements,
     String? firstPlayer,
     int? roundNumber,
+    bool announcementsAdjusted = false,
     required String source,
   }) async {
     if (!mounted || !cardManager.isAnnouncementPhase) return;
@@ -316,29 +318,19 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       _syncRoundNumber(roundNumber);
     }
 
+    var showAdjustmentMessage = announcementsAdjusted;
+
     if (announcements != null && announcements.isNotEmpty) {
-      final players = gameSession.players
-          .map((p) => p['name'] as String? ?? 'Joueur')
-          .toList();
+      showAdjustmentMessage = syncAnnouncementsFromBackendMap(
+        announcements,
+        announcementsAdjusted: announcementsAdjusted,
+      );
+      registerScoreboardFromSyncedAnnouncements();
+    }
 
-      for (final entry in announcements.entries) {
-        final playerName = entry.key.toString();
-        final announcement = (entry.value as num?)?.toInt() ?? 0;
-        final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
-        if (!existingAnnouncements.any((ann) => ann['player'] == playerName)) {
-          cardManager.makeAnnouncement(playerName, announcement);
-        }
-      }
-
-      final announcementsList = <int>[];
-      for (final playerName in players) {
-        announcementsList.add(
-          (announcements[playerName] as num?)?.toInt() ?? 0,
-        );
-      }
-      if (announcementsList.length == players.length) {
-        gameSession.addCurrentRound(announcementsList);
-      }
+    if (showAdjustmentMessage) {
+      await delayForLowTotalAnnouncementMessage(true);
+      if (!mounted) return;
     }
 
     if (mounted) setState(() {});
@@ -878,6 +870,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     _announcementPhaseStartedSubscription?.cancel();
     _announcementSubmittedSubscription?.cancel();
     _announcementsCompleteSubscription?.cancel();
+    _announcementsAdjustedSubscription?.cancel();
     _announcementPhaseTimer?.cancel();
     roomChatMessageSubscription?.cancel();
     cardPlayedSubscription?.cancel();
@@ -2099,6 +2092,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       final roundNumber = data['round_number'] as int?;
       final announcements = data['announcements'] as Map<String, dynamic>?;
       final firstPlayer = data['first_player'] as String?;
+      final announcementsAdjusted = data['announcements_adjusted'] == true;
       
       print('🔍 Vérification événement announcements_complete:');
       print('   - roomId reçu: $roomId (type: ${roomId.runtimeType})');
@@ -2121,11 +2115,31 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
               : null,
           firstPlayer: firstPlayer,
           roundNumber: roundNumber,
+          announcementsAdjusted: announcementsAdjusted,
           source: 'announcements_complete_ws',
         ));
       } else {
         print('⚠️ Événement announcements_complete ignoré (roomId ou roundNumber ne correspondent pas)');
       }
+    });
+
+    _announcementsAdjustedSubscription =
+        wsService.onAnnouncementsAdjusted().listen((data) {
+      if (!mounted || !cardManager.isAnnouncementPhase) return;
+
+      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+      if (roomId?.toString() != gameSession.roomId?.toString()) return;
+
+      final announcements = data['announcements'];
+      if (announcements is! Map) return;
+
+      print('📥 Événement announcements_adjusted reçu: $data');
+      syncAnnouncementsFromBackendMap(
+        Map<String, dynamic>.from(announcements),
+        announcementsAdjusted: true,
+      );
+      registerScoreboardFromSyncedAnnouncements();
+      if (mounted) setState(() {});
     });
 
     roomChatMessageSubscription = wsService.onRoomChatMessage().listen((data) {
@@ -5564,6 +5578,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           firstPlayer: responseData['first_player'] as String?,
           roundNumber: (responseData['round_number'] as num?)?.toInt() ??
               roundNumber,
+          announcementsAdjusted: responseData['announcements_adjusted'] == true,
           source: 'announce_http_response',
         );
       }

@@ -2779,6 +2779,54 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
 
   // Flag pour éviter les appels multiples à handleAnnouncementTurnComplete
 
+  /// Sync les annonces backend → local. Retourne true si un ajustement (+1) est détecté.
+  @protected
+  bool syncAnnouncementsFromBackendMap(
+    Map<String, dynamic> announcements, {
+    bool? announcementsAdjusted,
+  }) {
+    if (announcements.isEmpty) return false;
+
+    final localTotalBefore = cardManager
+        .getCurrentRoundAnnouncements()
+        .fold<int>(0, (sum, ann) => sum + ((ann['announcement'] as int?) ?? 0));
+
+    cardManager.syncAnnouncementsFromBackend(announcements);
+
+    final backendTotal = announcements.values.fold<int>(
+      0,
+      (sum, value) => sum + ((value as num?)?.toInt() ?? 0),
+    );
+
+    if (announcementsAdjusted == true) return true;
+    return localTotalBefore < 10 && backendTotal > localTotalBefore;
+  }
+
+  @protected
+  void registerScoreboardFromSyncedAnnouncements() {
+    final players = gameSession.players
+        .map((p) => p['name'] as String? ?? 'Joueur')
+        .toList();
+    final announcementsList = players.map((name) {
+      final ann = cardManager.getCurrentRoundAnnouncements().firstWhere(
+        (a) => a['player'] == name,
+        orElse: () => {'announcement': 0},
+      );
+      return (ann['announcement'] as int?) ?? 0;
+    }).toList();
+
+    if (announcementsList.length == players.length) {
+      gameSession.updateCurrentRoundAnnouncements(announcementsList);
+    }
+  }
+
+  @protected
+  Future<void> delayForLowTotalAnnouncementMessage(bool showMessage) async {
+    if (!showMessage || !mounted) return;
+    showLowTotalMessage();
+    await Future.delayed(const Duration(seconds: 3));
+  }
+
   // Fonction pour gérer la fin du tour d'annonce
   Future<void> handleAnnouncementTurnComplete() async {
     // ⚠️ Si la phase d'annonces est déjà terminée, ignorer les appels tardifs
@@ -2827,95 +2875,67 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
         announcementsMap[playerName] = announcement;
       }
 
-      bool needsNewBids = false;
+      bool needsLocalIncrement = false;
+      bool shouldShowAdjustmentMessage = false;
+      final roundId = await getRoundIdForCurrentRound();
+      final gameId = await getGameId();
+      final localTotalBefore = announcementsMap.values.fold<int>(0, (a, b) => a + b);
+
       try {
-        // Obtenir le round_id pour la validation backend
-        final roundId = await getRoundIdForCurrentRound();
         if (roundId != null) {
-          // Valider depuis le backend
           await GameApiService.instance.validateAnnouncements(
             roundId: roundId,
             announcements: announcementsMap,
           );
           print('✅ Annonces validées par le backend');
+
+          if (gameId != null) {
+            final turnData = await GameApiService.instance.getAnnouncementTurn(
+              gameId: gameId,
+              roundNumber: _effectiveRoundNumber(),
+            );
+            final backendRaw = turnData['announcements'];
+            if (backendRaw is Map && backendRaw.isNotEmpty) {
+              shouldShowAdjustmentMessage = syncAnnouncementsFromBackendMap(
+                Map<String, dynamic>.from(backendRaw),
+              );
+              registerScoreboardFromSyncedAnnouncements();
+            }
+          }
         } else {
-          // Fallback: validation locale si round_id n'est pas disponible
-          print('⚠️ round_id non disponible, utilisation de la validation locale');
+          print('⚠️ round_id non disponible, validation locale');
           final validationResult = gameLogic.validateAnnouncements(announcements);
-          needsNewBids = validationResult['needsNewBids'] == true;
+          needsLocalIncrement = validationResult['needsNewBids'] == true;
         }
       } catch (e) {
-        // Si la validation backend échoue (ex: somme = 13), utiliser la logique locale
-        print('⚠️ Erreur lors de la validation backend des annonces: $e');
-        print('   Utilisation de la validation locale comme fallback');
-        final validationResult = gameLogic.validateAnnouncements(announcements);
-        needsNewBids = validationResult['needsNewBids'] == true;
+        print('⚠️ Erreur validation/sync annonces backend: $e');
+        if (roundId == null) {
+          final validationResult = gameLogic.validateAnnouncements(announcements);
+          needsLocalIncrement = validationResult['needsNewBids'] == true;
+        } else if (localTotalBefore < 10) {
+          shouldShowAdjustmentMessage = true;
+        }
       }
 
-      if (needsNewBids) {
-        // Cas 2: Total < 10 → Ajouter +1 à chaque annonce et démarrer le jeu après notification
-        showLowTotalMessage();
-        // Ajouter +1 à chaque annonce dans le gestionnaire (fonctionne pour mode bot et humain)
+      if (needsLocalIncrement) {
+        shouldShowAdjustmentMessage = true;
         cardManager.incrementAllAnnouncements();
-        // Récupérer les annonces mises à jour
-        final updatedAnnouncements = cardManager
-            .getCurrentRoundAnnouncements();
-        print('📊 Annonces augmentées de +1 chacune: $updatedAnnouncements');
-
-        // Démarrer le jeu après 3 secondes
-        Future.delayed(const Duration(seconds: 3), () {
-          if (!mounted) return;
-          try {
-            // ✅ Réinitialiser le flag de joueur en cours avant de démarrer
-            currentPlayerPlaying = null;
-            
-            // ✅ Utiliser startGamePhase() pour initialiser correctement currentTrickNumber à 1
-            cardManager.startGamePhase();
-            
-            // Enregistrer le round actuel (R1 au premier coup, pas R2)
-            _registerCurrentRoundInScoreboard();
-            final currentRoundNum = gameSession.currentRound;
-
-            // Choisir le premier joueur de la phase de jeu selon la rotation par round
-            final starting = getStartingPlayerForRoundPlay(currentRoundNum);
-            cardManager.currentPlayerTurn = starting;
-            print('🎯 Premier joueur pour la phase de jeu (Round $currentRoundNum): $starting');
-
-            print('✅ Phase de jeu configurée - Premier joueur: $starting');
-
-          // ✅ Ajouter un délai pour éviter les animations incontrôlées
-          Future.delayed(const Duration(milliseconds: 800), () {
-            if (!mounted) return;
-            setState(() {
-              print('✅ Interface mise à jour');
-            });
-
-            // ✅ Le jeu démarre automatiquement sans message - les joueurs voient directement le premier tour
-
-            // ✅ Démarrer le moteur de jeu automatique pour les bots avec un petit délai supplémentaire
-            Future.delayed(const Duration(milliseconds: 500), () {
-              if (mounted && !cardManager.isAnnouncementPhase) {
-                scheduleMaybeAutoPlayCurrentBot();
-              }
-            });
-          });
-          } catch (e, stackTrace) {
-            print('❌ Erreur lors du démarrage de la phase de jeu : $e');
-            print('Stack trace : $stackTrace');
-          } finally {
-            // ✅ Réinitialiser le flag après traitement
-            isProcessingAnnouncementCompletion = false;
-          }
-        });
-        return; // Sortir pour éviter d'exécuter le code suivant
-      } else {
-        // Cas 3: Annonces valides → Commencer directement la phase de jeu
-        print('🎮 Démarrage de la phase de jeu !');
-        
-        // ✅ Démarrer directement la phase de jeu (pas d'affichage du tableau après les annonces)
-        // Le tableau de scores s'affichera uniquement à la fin de la manche
-        _startGamePhaseAfterAnnouncements();
+        registerScoreboardFromSyncedAnnouncements();
+        print(
+          '📊 Annonces augmentées localement (+1): ${cardManager.getCurrentRoundAnnouncements()}',
+        );
       }
+
+      if (shouldShowAdjustmentMessage) {
+        await delayForLowTotalAnnouncementMessage(true);
+        if (!mounted) return;
+        _startGamePhaseAfterAnnouncements();
+        return;
+      }
+
+      // Cas 3: Annonces valides → Commencer directement la phase de jeu
+      print('🎮 Démarrage de la phase de jeu !');
+      _startGamePhaseAfterAnnouncements();
     } else {
       // ✅ Vérifier d'abord si le joueur actuel a déjà fait son annonce
       final currentPlayerBeforeTurn = cardManager.currentPlayerTurn;

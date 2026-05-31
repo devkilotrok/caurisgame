@@ -525,6 +525,30 @@ class LocalCardManager {
     print('📊 Toutes les annonces ont été augmentées de +1');
   }
 
+  /// Remplace ou ajoute les annonces locales avec les valeurs du backend (ex. +1 si total < 10).
+  void syncAnnouncementsFromBackend(Map<String, dynamic> announcements) {
+    for (final entry in announcements.entries) {
+      final playerName = entry.key.toString();
+      final value = ((entry.value as num?)?.toInt() ?? 2).clamp(2, 13);
+
+      final index = _currentRoundAnnouncements.indexWhere(
+        (ann) => ann['player'] == playerName,
+      );
+
+      if (index >= 0) {
+        _currentRoundAnnouncements[index]['announcement'] = value;
+      } else {
+        _currentRoundAnnouncements.add({
+          'player': playerName,
+          'announcement': value,
+          'timestamp': DateTime.now(),
+        });
+      }
+    }
+
+    print('📊 Annonces synchronisées depuis le backend: $_currentRoundAnnouncements');
+  }
+
   /// True si toutes les mains sont vides (manche terminée).
   bool allCardsPlayed() {
     if (_distributedCards.isEmpty) return false;

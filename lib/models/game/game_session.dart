@@ -79,6 +79,21 @@ class GameSession {
     print('✅ Round $currentRound ajouté (sans incrément) avec annonces: $announcements');
   }
 
+  /// Met à jour les annonces du round en cours (ex. ajustement backend +1).
+  void updateCurrentRoundAnnouncements(List<int> announcements) {
+    if (!isGameActive) return;
+
+    for (var i = 0; i < roundsData.length; i++) {
+      if ((roundsData[i]['roundNumber'] as int) == currentRound) {
+        roundsData[i]['announcements'] = List<int>.from(announcements);
+        print('✅ Round $currentRound mis à jour avec annonces: $announcements');
+        return;
+      }
+    }
+
+    addCurrentRound(announcements);
+  }
+
   // Fonction pour ajouter une nouvelle ronde (incrémente currentRound)
   // Utilisée pour préparer le round suivant avant de commencer ses annonces
   void addRound(List<int> announcements) {
