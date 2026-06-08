@@ -549,12 +549,52 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
   String? _backendPlayFirstPlayer;
 
+  Timer? _botPlayFallbackTimer;
+
   bool get _isRoomCreator => gameSession.players.any(
         (p) =>
             (p['name'] as String?) == widget.currentPlayerName &&
             ((p['isCreator'] as bool?) == true ||
                 (p['is_creator'] as bool?) == true),
       );
+
+  bool _isBotPlayerName(String name) {
+    if (name.isEmpty) return false;
+    return gameSession.players.any((p) {
+      if ((p['name'] as String?) != name) return false;
+      final isBotValue = p['is_bot'];
+      final isReplacementBotValue = p['isReplacementBot'];
+      final isBot = isBotValue == true ||
+          isBotValue == 1 ||
+          (isBotValue is String && isBotValue == '1');
+      final isReplacementBot = isReplacementBotValue == true ||
+          isReplacementBotValue == 1 ||
+          (isReplacementBotValue is String && isReplacementBotValue == '1');
+      return isBot || isReplacementBot;
+    });
+  }
+
+  void _scheduleBotPlayFallback() {
+    if (gameSession.playWithBots) return;
+    final botName = cardManager.currentPlayerTurn;
+    if (!_isBotPlayerName(botName)) return;
+
+    _botPlayFallbackTimer?.cancel();
+    _botPlayFallbackTimer = Timer(const Duration(milliseconds: 2500), () {
+      if (!mounted || !shouldAllowAutoPlay()) return;
+      if (cardManager.currentPlayerTurn != botName) return;
+      if (!_isBotPlayerName(botName)) return;
+
+      final alreadyPlayed = cardManager.currentTrick.any(
+        (e) => (e['player'] as String?) == botName,
+      );
+      if (alreadyPlayed) return;
+      if (currentPlayerPlaying != null) return;
+
+      print('⚠️ Fallback bot: $botName joue via API (créateur inactif)');
+      super.maybeAutoPlayCurrentBot();
+    });
+  }
 
   bool get _useTestDistribution {
     if (!GameConstants.allowTwoHumanWithBotsTest) return false;
@@ -1743,12 +1783,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     hasGameStarted = true;
   }
 
-  /// Seul le créateur pilote les bots via l'API ; les autres clients affichent le WS.
+  /// Seul le créateur pilote les bots en priorité ; fallback si le bot ne joue pas.
   @override
   void maybeAutoPlayCurrentBot() {
     if (!gameSession.playWithBots && !_isRoomCreator) {
+      _scheduleBotPlayFallback();
       return;
     }
+    _botPlayFallbackTimer?.cancel();
     super.maybeAutoPlayCurrentBot();
   }
 
@@ -3308,9 +3350,12 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
                 trickNumber: trickNumber,
               );
               
-              if (trickData['success'] == true) {
+                if (trickData['success'] == true) {
                 print('✅ Nouveau trick prêt, le bot peut jouer');
                 scheduleMaybeAutoPlayCurrentBot();
+                if (!_isRoomCreator && _isBotPlayerName(cardManager.currentPlayerTurn)) {
+                  _scheduleBotPlayFallback();
+                }
               } else {
                 // ✅ Erreur 409 - le trick n'est pas encore prêt, attendre plus longtemps
                 final errorMessage = trickData['message']?.toString() ?? '';
