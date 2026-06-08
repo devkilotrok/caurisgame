@@ -978,13 +978,14 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     if (cardManager.isAnnouncementPhase) {
       return;
     }
-    
-    // ✅ Vérifier si ce joueur est déjà en train de jouer (éviter les doublons)
-    if (currentPlayerPlaying == widget.currentPlayerName) {
-      print('⚠️ ${widget.currentPlayerName} est déjà en train de jouer - évitement du doublon');
+
+    // ✅ Verrou immédiat (avant tout await) pour éviter le double-clic / double carte
+    if (currentPlayerPlaying != null) {
+      print('⚠️ ${currentPlayerPlaying} est déjà en train de jouer - évitement du doublon');
       return;
     }
-
+    currentPlayerPlaying = widget.currentPlayerName;
+    
     // Obtenir les cartes du joueur actuel
     final playerCards = cardManager.getPlayerCards(widget.currentPlayerName);
 
@@ -1008,6 +1009,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
         // Vérifier si la carte est jouable
         final cardCode = card['code'] as String;
         if (!playableCardCodes.contains(cardCode)) {
+          currentPlayerPlaying = null;
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text('Cette carte n\'est pas jouable selon les règles du jeu.'),
@@ -1029,6 +1031,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
           gameLogic.currentTrick.isEmpty,
         );
         if (!playable.contains(card)) {
+          currentPlayerPlaying = null;
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: const Text('Cette carte n\'est pas jouable.'),
@@ -1052,6 +1055,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
         gameLogic.currentTrick.isEmpty,
       );
       if (!playable.contains(card)) {
+        currentPlayerPlaying = null;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: const Text('Cette carte n\'est pas jouable.'),
@@ -1070,8 +1074,6 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     _playerTurnTimeoutTimer = null;
 
     // ✅ Marquer que ce joueur est en train de jouer (verrouillage de la main)
-    // ⚠️ IMPORTANT: Le verrouillage se fait APRÈS la validation pour éviter de verrouiller si la carte n'est pas jouable
-    currentPlayerPlaying = widget.currentPlayerName;
     if (mounted) {
       setState(() {
         // Mettre à jour l'UI pour désactiver toutes les cartes

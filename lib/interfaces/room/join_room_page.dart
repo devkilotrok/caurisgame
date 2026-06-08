@@ -582,9 +582,9 @@ class _JoinRoomPageState extends State<JoinRoomPage> {
           _buildInstructionStep(
             '4',
             'Attendez que '
-            '${GameConstants.isDevelopment ? GameConstants.temporaryHumanPlayerCount : GameConstants.standardPlayerCount} '
+            '${GameConstants.allowTwoHumanWithBotsTest ? GameConstants.temporaryHumanPlayerCount : GameConstants.standardPlayerCount} '
             'joueurs soient connectés'
-            '${GameConstants.isDevelopment ? ' (mode développement)' : ''}',
+            '${GameConstants.allowTwoHumanWithBotsTest ? ' (test : 2 humains + 2 bots)' : ''}',
           ),
           _buildInstructionStep('5', 'La partie commence automatiquement'),
         ],

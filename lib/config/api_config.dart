@@ -4,6 +4,9 @@
 /// En développement local, surchargez au build :
 ///   flutter run --dart-define=BASE_URL=http://192.168.1.50:8000/api \
 ///               --dart-define=WEBSOCKET_URL=ws://192.168.1.50:3000
+///
+/// Test multijoueur 2 humains + 2 bots (APK release) :
+///   flutter build apk --release --dart-define=ENABLE_TWO_HUMAN_TEST=true
 class ApiConfig {
   /// API REST (Laravel)
   static const String baseUrl = String.fromEnvironment(

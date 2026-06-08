@@ -5887,7 +5887,7 @@ class _GameRoomPageState extends State<GameRoomPage>
                   if (!_gameSession.playWithBots && !hasFullRoom)
                     Text(
                       'En attente des autres joueurs... (${currentPlayerCount}/$_requiredPlayers)'
-                      '${GameConstants.isDevelopment && !_gameSession.playWithBots ? ' • Mode développement (2 joueurs)' : ''}',
+                      '${GameConstants.allowTwoHumanWithBotsTest && !_gameSession.playWithBots ? ' • Test 2 humains + 2 bots' : ''}',
                       style: const TextStyle(
                         color: Colors.orangeAccent,
                         fontSize: 12,

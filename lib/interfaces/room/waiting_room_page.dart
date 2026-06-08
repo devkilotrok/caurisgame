@@ -258,7 +258,7 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
                 
                 Text(
                   'En attente que les $_requiredPlayerCount joueurs rejoignent'
-                  '${GameConstants.isDevelopment && _requiredPlayerCount == GameConstants.temporaryHumanPlayerCount ? ' (mode développement)' : ''}',
+                  '${GameConstants.allowTwoHumanWithBotsTest && _requiredPlayerCount == GameConstants.temporaryHumanPlayerCount ? ' (test : 2 humains + 2 bots)' : ''}',
                   style: TextStyle(
                     color: isDark ? Colors.grey : Colors.grey.shade600,
                     fontSize: 14,

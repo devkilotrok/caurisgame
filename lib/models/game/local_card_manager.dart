@@ -610,11 +610,6 @@ class LocalCardManager {
       _obtainedTricks[name] = 0;
     }
     
-    // Le joueur qui a annoncé le plus commence
-    if (_currentRoundAnnouncements.isNotEmpty) {
-      _currentPlayerTurn = _currentRoundAnnouncements[0]['player'];
-    }
-    
     print('Phase de jeu démarrée. Premier joueur: $_currentPlayerTurn');
   }
 

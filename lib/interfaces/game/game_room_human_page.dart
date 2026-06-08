@@ -9,6 +9,7 @@ import '../../services/api/game_api_service.dart';
 import '../../services/user/user_service.dart';
 import '../../models/game/local_card_manager.dart';
 import '../../services/websocket/game_websocket_service.dart';
+import '../../config/game_constants.dart';
 import 'game_room_base_page.dart';
 import 'game_room_polling_policy.dart';
 
@@ -54,6 +55,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   int? _distributionRoundApplied;
   bool _waitingForHumans = false;
   bool _distributionRequestInFlight = false;
+  bool _botsFillInFlight = false;
   final Set<String> _wsJoinedPlayerNames = <String>{};
   Map<String, dynamic>? _pendingAnnouncementPhasePayload;
   bool _isProcessingAnnouncementTurn = false;
@@ -134,8 +136,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     if (!hasGameStarted &&
         !_distributionRequestInFlight &&
+        !_botsFillInFlight &&
         _hasFullHttpRoom() &&
         _hasAllPlayersJoinedWebSocket()) {
+      if (_useTestDistribution &&
+          gameSession.players.length < GameConstants.standardPlayerCount) {
+        print('⏳ Mode test: fillBots requis avant distribution auto');
+        return;
+      }
       final isCreator = gameSession.players.any(
         (p) =>
             (p['name'] as String?) == widget.currentPlayerName &&
@@ -295,6 +303,16 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     return roundNumber == gameSession.currentRound;
   }
 
+  @override
+  String getStartingPlayerForRoundPlay(int roundNumber) {
+    if (_backendPlayFirstPlayer != null &&
+        _backendPlayFirstPlayer!.isNotEmpty &&
+        roundNumber == gameSession.currentRound) {
+      return _backendPlayFirstPlayer!;
+    }
+    return super.getStartingPlayerForRoundPlay(roundNumber);
+  }
+
   /// Démarre la phase de jeu quand le backend confirme que toutes les annonces sont faites.
   Future<void> _completeAnnouncementPhaseFromBackend({
     Map<String, dynamic>? announcements,
@@ -335,20 +353,23 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     if (mounted) setState(() {});
 
+    if (firstPlayer != null && firstPlayer.isNotEmpty) {
+      _backendPlayFirstPlayer = firstPlayer;
+    }
+
     await handleAnnouncementTurnComplete();
     _restartRoomSyncPolling(forceRestart: true);
 
-    if (firstPlayer != null && firstPlayer.isNotEmpty && mounted) {
-      Future.delayed(const Duration(milliseconds: 100), () {
+    if (_backendPlayFirstPlayer != null &&
+        _backendPlayFirstPlayer!.isNotEmpty &&
+        mounted &&
+        !cardManager.isAnnouncementPhase) {
+      cardManager.currentPlayerTurn = _backendPlayFirstPlayer!;
+      setState(() {});
+      startPlayerTurnTimeout();
+      Future.delayed(const Duration(milliseconds: 500), () {
         if (mounted && !cardManager.isAnnouncementPhase) {
-          cardManager.currentPlayerTurn = firstPlayer;
-          setState(() {});
-          startPlayerTurnTimeout();
-          Future.delayed(const Duration(milliseconds: 500), () {
-            if (mounted && !cardManager.isAnnouncementPhase) {
-              maybeAutoPlayCurrentBot();
-            }
-          });
+          maybeAutoPlayCurrentBot();
         }
       });
     }
@@ -526,10 +547,34 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   bool _showDebugLogs = false;
   static const int _maxLogs = 20;
 
+  String? _backendPlayFirstPlayer;
+
+  bool get _isRoomCreator => gameSession.players.any(
+        (p) =>
+            (p['name'] as String?) == widget.currentPlayerName &&
+            ((p['isCreator'] as bool?) == true ||
+                (p['is_creator'] as bool?) == true),
+      );
+
   bool get _useTestDistribution {
-    if (!kDebugMode) return false;
-    final playerCount = gameSession.players.length;
-    return playerCount == 2;
+    if (!GameConstants.allowTwoHumanWithBotsTest) return false;
+
+    final players = gameSession.players;
+    if (players.isEmpty) return false;
+
+    int humanCount = 0;
+    for (final player in players) {
+      final isBotValue = player['is_bot'];
+      final isBot = isBotValue == true ||
+          isBotValue == 1 ||
+          (isBotValue is String && isBotValue == '1');
+      if (!isBot) humanCount++;
+    }
+
+    // 2 humains seuls, ou 2 humains + bots déjà ajoutés (4 en salle).
+    return humanCount == 2 &&
+        (players.length == 2 ||
+            players.length >= GameConstants.standardPlayerCount);
   }
 
   // ✅ Surcharger isTestMode pour retourner _useTestDistribution
@@ -1141,12 +1186,19 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       print('   _useTestDistribution=$_useTestDistribution');
       print('   kDebugMode=${kDebugMode}');
       
-      if (effectivePlayerNames.length == 2 && _useTestDistribution) {
+      if (_useTestDistribution &&
+          gameSession.players.length < GameConstants.standardPlayerCount) {
         final roomId = gameSession.roomId ?? '';
-        if (roomId.isNotEmpty) {
+        if (roomId.isEmpty) {
+          print('⚠️ Room ID vide, impossible d\'ajouter les bots');
+        } else if (_botsFillInFlight) {
+          print('⏳ fillBots déjà en cours...');
+        } else {
+          _botsFillInFlight = true;
           try {
-            print('🤖 Ajout automatique de Bot 1 et Bot 2 pour compléter à 4 joueurs...');
-            final fillBotsResult = await GameApiService.instance.fillBots(roomId: roomId);
+            print('🤖 Compléter la salle à 4 joueurs (mode test)...');
+            final fillBotsResult =
+                await GameApiService.instance.fillBots(roomId: roomId);
             print('✅ fillBots appelé avec succès: $fillBotsResult');
             
             // ✅ Attendre un peu pour que le backend traite l'ajout des bots
@@ -1297,22 +1349,23 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           } catch (e, stackTrace) {
             print('⚠️ Erreur lors de l\'ajout des bots: $e');
             print('   Stack trace: $stackTrace');
-            // Continuer même si l'ajout des bots échoue
+          } finally {
+            _botsFillInFlight = false;
           }
-        } else {
-          print('⚠️ Room ID vide, impossible d\'ajouter les bots');
         }
-      } else {
+      } else if (!_useTestDistribution) {
         print('ℹ️ Condition non remplie pour ajout automatique des bots');
-        print('   effectivePlayerNames.length == 2: ${effectivePlayerNames.length == 2}');
-        print('   _useTestDistribution: $_useTestDistribution');
       }
 
-      if (effectivePlayerNames.length < requiredPlayers) {
+      final minPlayersForDistribution = _useTestDistribution
+          ? GameConstants.standardPlayerCount
+          : requiredPlayers;
+
+      if (effectivePlayerNames.length < minPlayersForDistribution) {
         waitingForHumans = true;
         setState(() {});
         print(
-          '⏳ Distribution reportée: ${effectivePlayerNames.length}/$requiredPlayers '
+          '⏳ Distribution reportée: ${effectivePlayerNames.length}/$minPlayersForDistribution '
           'joueurs HTTP dans la salle',
         );
         return;
@@ -1581,6 +1634,11 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   }
 
   void _scheduleBotAnnouncementsAfterPhaseStart() {
+    if (!_isRoomCreator) {
+      print('ℹ️ Annonces bots : gérées par le créateur (pas ce client)');
+      return;
+    }
+
     Future.delayed(const Duration(seconds: 10), () async {
       if (!mounted || !cardManager.isAnnouncementPhase) return;
 
@@ -1681,10 +1739,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     // ✅ NOUVEAU: Les bots annonceront automatiquement après réception de announcement_phase_started
     // (géré dans le listener _announcementPhaseStartedSubscription)
     
-    // ✅ Démarrer le timer d'annonce pour le premier joueur (obtient le tour depuis le backend)
-    super.startAnnouncementTimerForCurrentPlayer().then((_) {
-      hasGameStarted = true;
-    });
+    // Mode simultané : announcement_phase_started (WS) pilote les annonces.
+    hasGameStarted = true;
   }
 
   // Surcharger playCard pour ajouter l'envoi WebSocket
@@ -2069,13 +2125,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         final playerNames = gameSession.players
             .map((p) => p['name'] as String? ?? 'Joueur')
             .toList();
-        final allLocal = cardManager.areAllAnnouncementsDone(playerNames);
-        final allSubmitted =
-            submittedCount != null && submittedCount >= requiredPlayers;
-        if (allLocal || allSubmitted) {
+        if (cardManager.areAllAnnouncementsDone(playerNames)) {
           unawaited(
             _tryCompleteAnnouncementPhaseFromBackend(
-              reason: 'announcement_submitted',
+              reason: 'announcement_submitted_all_local',
             ),
           );
         }
@@ -2315,9 +2368,162 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     return _updatePlayableCardsFromBackend();
   }
 
+  int? _lastProcessedTrickCompletedNumber;
+
+  /// Construit une carte jouable à partir d'un code (ex: 7H, AS).
+  Map<String, dynamic> _cardMapFromCode(String cardCode) {
+    final code = cardCode.toUpperCase();
+    final suitShort = code.substring(code.length - 1);
+    final valueShort = code.substring(0, code.length - 1);
+    const suitMapping = {
+      'S': 'SPADES',
+      'C': 'CLUBS',
+      'H': 'HEARTS',
+      'D': 'DIAMONDS',
+    };
+    const valueMapping = {
+      'A': 'ACE',
+      'K': 'KING',
+      'Q': 'QUEEN',
+      'J': 'JACK',
+      '0': '10',
+    };
+    final suitName = suitMapping[suitShort] ?? suitShort;
+    final valueName = valueMapping[valueShort] ?? valueShort;
+    return {
+      'code': code,
+      'suit': suitName,
+      'value': valueName,
+      'image': 'assets/images/cards/${suitName.toLowerCase()}_$valueName.png',
+    };
+  }
+
+  /// Synchronise le pli local avec les cartes envoyées par le backend.
+  Future<void> _syncTrickCardsFromPayload(List<dynamic> trickCardsPayload) async {
+    for (final raw in trickCardsPayload) {
+      if (raw is! Map) continue;
+      final playerName = (raw['player_name'] ?? raw['playerName']) as String?;
+      final cardCode = ((raw['card_code'] ?? raw['cardCode']) as String?)?.toUpperCase();
+      if (playerName == null || cardCode == null || cardCode.isEmpty) continue;
+
+      final alreadyPresent = cardManager.currentTrick.any((entry) {
+        final entryPlayer = entry['player'] as String?;
+        final entryCard = entry['card'] as Map<String, dynamic>?;
+        return entryPlayer == playerName &&
+            (entryCard?['code'] as String?)?.toUpperCase() == cardCode;
+      });
+      if (alreadyPresent) continue;
+
+      print('🔄 Resync trick: ajout $cardCode pour $playerName (payload backend)');
+      cardManager.addCardToTrick(playerName, _cardMapFromCode(cardCode));
+    }
+  }
+
+  /// Applique les compteurs de plis depuis le backend (source de vérité).
+  void _applyObtainedTricksFromBackend(dynamic obtainedTricksRaw) {
+    if (obtainedTricksRaw == null) return;
+
+    Map<String, dynamic> obtainedMap;
+    if (obtainedTricksRaw is Map) {
+      obtainedMap = Map<String, dynamic>.from(obtainedTricksRaw);
+    } else if (obtainedTricksRaw is List) {
+      print('⚠️ obtained_tricks reçu comme List, conversion ignorée');
+      return;
+    } else {
+      return;
+    }
+
+    for (final entry in obtainedMap.entries) {
+      final playerName = entry.key;
+      final count = (entry.value as num?)?.toInt() ?? 0;
+      cardManager.setObtainedTricks(playerName, count);
+      print('📊 Compteur backend: $playerName → $count plis');
+    }
+  }
+
+  /// Traite trick_completed : resync cartes, compteurs backend, puis animation.
+  Future<void> _onTrickCompletedFromWebSocket(Map<String, dynamic> data) async {
+    if (!mounted) return;
+
+    final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+    final winnerName = data['winnerName'] as String? ?? data['winner_name'] as String?;
+    final currentTrickNumber = data['currentTrickNumber'] as int? ??
+        data['current_trick_number'] as int?;
+    final nextTrickNumber = data['nextTrickNumber'] as int? ??
+        data['next_trick_number'] as int?;
+    final obtainedTricks = data['obtainedTricks'] ?? data['obtained_tricks'];
+    final trickCardsPayload = data['trick_cards'] ?? data['trickCards'];
+
+    if (roomId != gameSession.roomId || winnerName == null || winnerName.isEmpty) {
+      return;
+    }
+
+    if (currentTrickNumber != null &&
+        _lastProcessedTrickCompletedNumber == currentTrickNumber) {
+      print('ℹ️ trick_completed #$currentTrickNumber déjà traité — ignoré');
+      return;
+    }
+
+    final logMsg = '📥 Événement trick_completed reçu: winner=$winnerName, trick=$currentTrickNumber';
+    print(logMsg);
+    _addDebugLog(logMsg);
+
+    // 1. Compléter le pli local depuis le payload backend si incomplet
+    if (trickCardsPayload is List && trickCardsPayload.isNotEmpty) {
+      await _syncTrickCardsFromPayload(trickCardsPayload);
+    } else {
+      int attempts = 0;
+      while (attempts < 20 &&
+          cardManager.currentTrick.length < cardManager.expectedPlayerCount) {
+        await Future.delayed(const Duration(milliseconds: 100));
+        attempts++;
+      }
+    }
+
+    // 2. Compteurs depuis le backend (pas d'incrément local)
+    _applyObtainedTricksFromBackend(obtainedTricks);
+
+    if (currentTrickNumber != null) {
+      _lastProcessedTrickCompletedNumber = currentTrickNumber;
+    }
+
+    final isRoundComplete = (nextTrickNumber != null && nextTrickNumber > 13) ||
+        (nextTrickNumber == null &&
+            currentTrickNumber != null &&
+            currentTrickNumber >= 13) ||
+        (currentTrickNumber != null && currentTrickNumber > 13);
+
+    if (isRoundComplete) {
+      print('🎉 Dernier trick terminé ! Manche terminée.');
+      if (mounted) setState(() {});
+      Future.delayed(const Duration(milliseconds: 500), () {
+        if (mounted && !cardManager.isAnnouncementPhase) {
+          onRoundCompleted();
+        }
+      });
+      return;
+    }
+
+    if (mounted) {
+      setState(() {});
+      print('✅ Compteurs synchronisés depuis backend pour trick #$currentTrickNumber');
+    }
+
+    // 3. Animation + nettoyage ; le numéro de pli suivant est appliqué après l'animation
+    await _handleTrickEnd(
+      winnerName,
+      currentTrickNumber,
+      nextTrickNumber: nextTrickNumber,
+    );
+  }
+
   /// Méthode dédiée pour gérer la fin d'un pli (animation + nettoyage)
   /// Appelée depuis le listener trick_completed
-  Future<void> _handleTrickEnd(String winnerName, int? trickNumber) async {
+  Future<void> _handleTrickEnd(
+    String winnerName,
+    int? trickNumber, {
+    int? nextTrickNumber,
+  }) async {
     if (!mounted) return;
 
     final trickCards = cardManager.currentTrick;
@@ -2337,15 +2543,22 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       final logMsg2 = '⚠️ Trick vide - impossible de déclencher l\'animation de collecte';
       print(logMsg2);
       _addDebugLog(logMsg2);
-      // Si le trick est vide, on nettoie quand même et on passe au suivant
       cardManager.clearCurrentTrick();
+      if (nextTrickNumber != null) {
+        cardManager.setCurrentTrickNumber(nextTrickNumber);
+      } else if (trickNumber != null && trickNumber < 13) {
+        cardManager.setCurrentTrickNumber(trickNumber + 1);
+      }
+      cardManager.currentPlayerTurn = winnerName;
       if (mounted) {
         setState(() {
           isCollectingTrick = false;
           lastTrickWinner = null;
         });
       }
-      // Passer au joueur suivant si c'est un bot
+      if (cardManager.currentPlayerTurn == widget.currentPlayerName) {
+        _updatePlayableCardsFromBackend();
+      }
       Future.delayed(const Duration(milliseconds: 300), () {
         if (!mounted) return;
         final current = cardManager.currentPlayerTurn;
@@ -2431,6 +2644,20 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       final logMsg5 = '🧹 Trick vidé après animation (${trickSizeBeforeClear} cartes supprimées)';
       print(logMsg5);
       _addDebugLog(logMsg5);
+
+      // Appliquer le numéro du prochain pli APRÈS l'animation (évite désync visuelle)
+      if (nextTrickNumber != null) {
+        cardManager.setCurrentTrickNumber(nextTrickNumber);
+      } else if (trickNumber != null && trickNumber < 13) {
+        cardManager.setCurrentTrickNumber(trickNumber + 1);
+      }
+
+      cardManager.currentPlayerTurn = winnerName;
+      print('Tour (gagnant du pli): $winnerName');
+
+      if (cardManager.currentPlayerTurn == widget.currentPlayerName) {
+        _updatePlayableCardsFromBackend();
+      }
       
       // Mettre à jour l'UI pour cacher l'animation et réinitialiser les variables
       if (mounted) {
@@ -2520,139 +2747,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     });
   }
 
-    // ✅ Écouter l'événement trick_completed pour synchroniser le tour ET les compteurs
+    // ✅ Écouter trick_completed : resync cartes + compteurs backend, puis animation
     _trickCompletedSubscription = wsService.onTrickCompleted().listen((data) {
       if (!mounted) return;
-
-      final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
-      final winnerName = data['winnerName'] as String? ?? data['winner_name'] as String?;
-      final currentTrickNumber = data['currentTrickNumber'] as int? ??
-          data['current_trick_number'] as int?;
-      final nextTrickNumber = data['nextTrickNumber'] as int? ??
-          data['next_trick_number'] as int?;
-      final obtainedTricks = (data['obtainedTricks'] ??
-              data['obtained_tricks']) as Map<String, dynamic>?;
-
-      if (roomId != gameSession.roomId || winnerName == null || winnerName.isEmpty) {
-        return;
-      }
-
-      final logMsg = '📥 Événement trick_completed reçu: winner=$winnerName, trick=$currentTrickNumber';
-      print(logMsg);
-      _addDebugLog(logMsg);
-
-      final currentTrickSize = cardManager.currentTrick.length;
-      final expectedTrickSize = cardManager.expectedPlayerCount;
-      final localTrickNumber = cardManager.currentTrickNumber;
-
-      // ✅ Si le trick est incomplet, attendre un peu pour que les cartes arrivent via WebSocket
-      //    Mais ne pas ignorer complètement l'événement (les compteurs doivent être mis à jour)
-      if (currentTrickSize > 0 &&
-          currentTrickSize < expectedTrickSize &&
-          (currentTrickNumber == null || currentTrickNumber == localTrickNumber - 1)) {
-        print('⚠️ Trick local incomplet: $currentTrickSize/$expectedTrickSize - Attente des cartes manquantes...');
-        // Attendre un peu pour que les cartes arrivent via WebSocket
-        Future.delayed(const Duration(milliseconds: 500), () {
-          if (!mounted) return;
-          final updatedTrickSize = cardManager.currentTrick.length;
-          print('📊 Après attente: $updatedTrickSize/$expectedTrickSize cartes dans le trick');
-          // Continuer avec le traitement même si le trick est encore incomplet
-          // (les compteurs doivent être mis à jour de toute façon)
-        });
-        // Ne pas return ici - on continue pour mettre à jour les compteurs
-      }
-
-      bool needsUpdate = false;
-
-      // ✅ MISE À JOUR UNIQUEMENT DU COMPTEUR DU GAGNANT
-      // IMPORTANT: Tous les joueurs reçoivent cet événement et mettent à jour le compteur du gagnant
-      // Cela garantit que tous les joueurs voient la mise à jour du compteur
-      if (winnerName.isNotEmpty) {
-        final currentCount = cardManager.getObtainedTricks(winnerName);
-        final newCount = currentCount + 1;
-        
-        // ✅ DEBUG: Vérifier avant la mise à jour
-        print('📊 Avant mise à jour compteur: $winnerName a $currentCount plis');
-        
-        cardManager.setObtainedTricks(winnerName, newCount);
-        
-        // ✅ DEBUG: Vérifier après la mise à jour
-        final verifiedCount = cardManager.getObtainedTricks(winnerName);
-        if (verifiedCount != newCount) {
-          print('❌ ERREUR: Compteur non mis à jour correctement ! Attendu: $newCount, Obtenu: $verifiedCount');
-        } else {
-          print('✅ Vérification: Compteur bien mis à jour - $winnerName a maintenant $verifiedCount plis');
-        }
-        
-        needsUpdate = true;
-        print('📊 Mise à jour compteur du gagnant (trick_completed): $winnerName → $newCount plis (était: $currentCount)');
-        print('   ✅ Tous les joueurs voient cette mise à jour via l\'événement WebSocket trick_completed');
-      }
-      
-      // ⚠️ NOTE: On n'utilise PAS obtainedTricks du backend pour mettre à jour tous les compteurs
-      // car cela peut causer des désynchronisations. On fait confiance au backend pour déterminer
-      // le gagnant, mais on gère les compteurs localement en incrémentant uniquement le gagnant.
-      // Tous les clients reçoivent l'événement trick_completed et mettent à jour le compteur du gagnant.
-
-      bool turnChanged = false;
-      if (cardManager.currentPlayerTurn != winnerName) {
-        print('🔄 Synchronisation du tour (trick_completed): $winnerName doit jouer');
-        cardManager.currentPlayerTurn = winnerName;
-        turnChanged = true;
-      }
-
-      // ✅ OPTIMISATION: Vérifier si c'est le dernier trick (fin de manche)
-      // Une manche = exactement 13 tricks (4 joueurs × 13 cartes = 52 cartes)
-      // Si nextTrickNumber est null ou > 13, c'est la fin de la manche
-      // Si currentTrickNumber = 13, c'est aussi la fin (le 13ème trick vient de se terminer)
-      final isRoundComplete = (nextTrickNumber != null && nextTrickNumber > 13) ||
-          (nextTrickNumber == null && currentTrickNumber != null && currentTrickNumber >= 13) ||
-          (currentTrickNumber != null && currentTrickNumber > 13);
-      
-      if (isRoundComplete) {
-        print('🎉 Dernier trick terminé ! Manche terminée (currentTrick=$currentTrickNumber, nextTrick=$nextTrickNumber).');
-        // Appeler onRoundCompleted() directement
-        Future.delayed(const Duration(milliseconds: 500), () {
-          if (mounted && !cardManager.isAnnouncementPhase) {
-            onRoundCompleted();
-          }
-        });
-        // Ne pas appeler _handleTrickEnd si la manche est terminée
-        return;
-      }
-
-      // Mettre à jour le numéro de trick pour le prochain trick
-      if (nextTrickNumber != null) {
-        cardManager.setCurrentTrickNumber(nextTrickNumber);
-      } else if (currentTrickNumber != null && currentTrickNumber < 13) {
-        cardManager.setCurrentTrickNumber(currentTrickNumber + 1);
-      }
-      
-      // ✅ Mettre à jour les cartes jouables après un trick complété
-      if (cardManager.currentPlayerTurn == widget.currentPlayerName) {
-        _updatePlayableCardsFromBackend();
-      }
-      
-      // ✅ Appeler la méthode dédiée pour gérer la fin du pli
-      _handleTrickEnd(winnerName, currentTrickNumber);
-
-      // ✅ TOUJOURS mettre à jour l'UI pour que tous les joueurs voient la mise à jour du compteur
-      // IMPORTANT: On force TOUJOURS un setState() pour garantir que l'UI affiche le nouveau compteur
-      if (mounted) {
-        setState(() {
-          // ✅ Force la mise à jour de l'UI pour afficher le nouveau compteur du gagnant
-          // Tous les joueurs verront cette mise à jour car ils reçoivent tous l'événement trick_completed
-          // Le setState() déclenchera un rebuild de tous les widgets, y compris ceux qui affichent les compteurs
-        });
-        print('✅ setState() appelé pour synchroniser les compteurs et le tour - TOUS LES JOUEURS voient la mise à jour');
-        
-        // ✅ DEBUG: Vérifier que le compteur est bien affiché après setState
-        if (winnerName.isNotEmpty) {
-          final displayedCount = cardManager.getObtainedTricks(winnerName);
-          final displayText = getPlayerAnnouncementDisplay(winnerName);
-          print('🔍 Après setState: Compteur affiché pour $winnerName = $displayedCount plis (affichage: $displayText)');
-        }
-      }
+      _onTrickCompletedFromWebSocket(Map<String, dynamic>.from(data));
     });
 
     // ✅ Écouter l'événement round_completed_broadcast pour synchroniser le tableau de scores
@@ -5599,36 +5697,40 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       
     } catch (e) {
       print('❌ Erreur lors de l\'envoi de l\'annonce au backend: $e');
-      
-      // ✅ CORRECTION: En cas d'erreur, enregistrer l'annonce localement comme fallback
-      // Le timeout ou le backend assignera l'annonce si nécessaire
-      // Mais on l'enregistre localement pour que l'UI soit cohérente
-      final announcements = cardManager.getCurrentRoundAnnouncements();
-      final alreadyInLocal = announcements.any(
-        (ann) => ann['player'] == playerName,
-      );
-      
-      if (!alreadyInLocal) {
-        print('⚠️ Enregistrement local de l\'annonce comme fallback (erreur API)');
-        cardManager.makeAnnouncement(playerName, clampedAnnouncement);
+
+      final errorText = e.toString().toLowerCase();
+      final phaseAlreadyClosed = errorText.contains('phase d\'annonces n\'est pas active') ||
+          errorText.contains('not active');
+
+      if (phaseAlreadyClosed) {
+        print('ℹ️ Phase déjà fermée côté serveur — resync HTTP');
+        unawaited(_tryCompleteAnnouncementPhaseFromBackend(
+          reason: 'announce_after_phase_closed',
+        ));
         if (mounted) {
-          setState(() {
-            hasAnnounced = true;
-            currentAnnouncement = clampedAnnouncement;
-          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Phase d\'annonces terminée. Synchronisation en cours…',
+              ),
+              duration: Duration(seconds: 2),
+              backgroundColor: Colors.blue,
+              behavior: SnackBarBehavior.floating,
+              margin: EdgeInsets.only(bottom: 100, left: 20, right: 20),
+            ),
+          );
         }
+        return;
       }
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Annonce enregistrée localement. Synchronisation serveur en cours…',
-            ),
-            duration: Duration(seconds: 2),
-            backgroundColor: Colors.orange,
+          SnackBar(
+            content: Text('Erreur annonce: ${e.toString().split('\n').first}'),
+            duration: const Duration(seconds: 3),
+            backgroundColor: Colors.red,
             behavior: SnackBarBehavior.floating,
-            margin: EdgeInsets.only(bottom: 100, left: 20, right: 20),
+            margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
           ),
         );
       }
