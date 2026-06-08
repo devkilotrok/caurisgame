@@ -2276,476 +2276,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       }
     });
 
-  /// Méthode utilitaire pour ajouter un log de débogage (pour l'UI et la console)
-  void _addDebugLog(String log) {
-    if (!kDebugMode) return;
-
-    final timestamp = DateTime.now().toIso8601String().substring(11, 23); // HH:mm:ss.sss
-
-    final formattedLog = '[$timestamp] $log';
-
-    if (mounted) {
-      setState(() {
-        _debugLogs.insert(0, formattedLog); // Ajouter au début
-        if (_debugLogs.length > _maxLogs) {
-          _debugLogs.removeLast(); // Maintenir la taille max
-        }
-      });
-    }
-  }
-
-  /// Implémentation de la méthode abstraite:
-  /// Récupère la liste des codes de cartes jouables pour le joueur actuel depuis le backend.
-  @override
-  Future<void> _updatePlayableCardsFromBackend({bool force = false}) async {
-    if (_isUpdatingPlayableCards && !force) {
-      _addDebugLog('⚠️ Déjà en cours de mise à jour des cartes jouables (force=false). Ignoré.');
-      return;
-    }
-    _addDebugLog('🔄 Début de la mise à jour des cartes jouables (force=$force)...');
-    
-    setState(() {
-      _isUpdatingPlayableCards = true;
-    });
-
-    final currentRoomId = gameSession.roomId;
-    if (currentRoomId == null || currentRoomId.isEmpty) {
-      _addDebugLog('❌ Room ID est null/vide. Impossible de récupérer les cartes jouables.');
-      setState(() {
-        _isUpdatingPlayableCards = false;
-      });
-      return;
-    }
-
-    try {
-      // Obtenir les IDs nécessaires pour l'API
-      final gameId = await getGameId();
-      final roundId = await getRoundIdForCurrentRound();
-      final trickId = await getTrickIdForCurrentTrick();
-      final playerId = await getPlayerId(widget.currentPlayerName);
-      
-      if (gameId != null && roundId != null && trickId != null && playerId != null) {
-        final playableCardCodesList = await GameApiService.instance.getPlayableCards(
-          gameId: gameId,
-          roundId: roundId,
-          trickId: trickId,
-          playerId: playerId,
-        );
-        
-        final playableCardCodes = playableCardCodesList.toSet();
-        final message = '✅ Cartes jouables mises à jour : ${playableCardCodes.length} cartes. Codes: ${playableCardCodes.take(5).join(', ')}...';
-        _addDebugLog(message);
-        print(message); // Console log
-
-        setState(() {
-          _playableCardCodes = playableCardCodes;
-          _isUpdatingPlayableCards = false;
-        });
-      } else {
-        final errorMsg = '❌ IDs non disponibles (gameId=$gameId, roundId=$roundId, trickId=$trickId, playerId=$playerId)';
-        _addDebugLog(errorMsg);
-        print(errorMsg);
-        setState(() {
-          _playableCardCodes.clear();
-          _isUpdatingPlayableCards = false;
-        });
-      }
-    } catch (e) {
-      final errorMsg = '❌ Erreur lors de la récupération des cartes jouables: $e';
-      _addDebugLog(errorMsg);
-      print(errorMsg); // Console log
-      if (mounted) {
-        setState(() {
-          _playableCardCodes.clear();
-          _isUpdatingPlayableCards = false;
-        });
-      }
-    }
-  }
-
-  // ✅ Méthode publique helper pour être accessible dans les closures
-  Future<void> updatePlayableCardsFromBackend() async {
-    return _updatePlayableCardsFromBackend();
-  }
-
-  int? _lastProcessedTrickCompletedNumber;
-
-  /// Construit une carte jouable à partir d'un code (ex: 7H, AS).
-  Map<String, dynamic> _cardMapFromCode(String cardCode) {
-    final code = cardCode.toUpperCase();
-    final suitShort = code.substring(code.length - 1);
-    final valueShort = code.substring(0, code.length - 1);
-    const suitMapping = {
-      'S': 'SPADES',
-      'C': 'CLUBS',
-      'H': 'HEARTS',
-      'D': 'DIAMONDS',
-    };
-    const valueMapping = {
-      'A': 'ACE',
-      'K': 'KING',
-      'Q': 'QUEEN',
-      'J': 'JACK',
-      '0': '10',
-    };
-    final suitName = suitMapping[suitShort] ?? suitShort;
-    final valueName = valueMapping[valueShort] ?? valueShort;
-    return {
-      'code': code,
-      'suit': suitName,
-      'value': valueName,
-      'image': 'assets/images/cards/${suitName.toLowerCase()}_$valueName.png',
-    };
-  }
-
-  /// Synchronise le pli local avec les cartes envoyées par le backend.
-  Future<void> _syncTrickCardsFromPayload(List<dynamic> trickCardsPayload) async {
-    for (final raw in trickCardsPayload) {
-      if (raw is! Map) continue;
-      final playerName = (raw['player_name'] ?? raw['playerName']) as String?;
-      final cardCode = ((raw['card_code'] ?? raw['cardCode']) as String?)?.toUpperCase();
-      if (playerName == null || cardCode == null || cardCode.isEmpty) continue;
-
-      final alreadyPresent = cardManager.currentTrick.any((entry) {
-        final entryPlayer = entry['player'] as String?;
-        final entryCard = entry['card'] as Map<String, dynamic>?;
-        return entryPlayer == playerName &&
-            (entryCard?['code'] as String?)?.toUpperCase() == cardCode;
-      });
-      if (alreadyPresent) continue;
-
-      print('🔄 Resync trick: ajout $cardCode pour $playerName (payload backend)');
-      cardManager.addCardToTrick(playerName, _cardMapFromCode(cardCode));
-    }
-  }
-
-  /// Applique les compteurs de plis depuis le backend (source de vérité).
-  void _applyObtainedTricksFromBackend(dynamic obtainedTricksRaw) {
-    if (obtainedTricksRaw == null) return;
-
-    Map<String, dynamic> obtainedMap;
-    if (obtainedTricksRaw is Map) {
-      obtainedMap = Map<String, dynamic>.from(obtainedTricksRaw);
-    } else if (obtainedTricksRaw is List) {
-      print('⚠️ obtained_tricks reçu comme List, conversion ignorée');
-      return;
-    } else {
-      return;
-    }
-
-    for (final entry in obtainedMap.entries) {
-      final playerName = entry.key;
-      final count = (entry.value as num?)?.toInt() ?? 0;
-      cardManager.setObtainedTricks(playerName, count);
-      print('📊 Compteur backend: $playerName → $count plis');
-    }
-  }
-
-  /// Traite trick_completed : resync cartes, compteurs backend, puis animation.
-  Future<void> _onTrickCompletedFromWebSocket(Map<String, dynamic> data) async {
-    if (!mounted) return;
-
-    final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
-    final winnerName = data['winnerName'] as String? ?? data['winner_name'] as String?;
-    final currentTrickNumber = data['currentTrickNumber'] as int? ??
-        data['current_trick_number'] as int?;
-    final nextTrickNumber = data['nextTrickNumber'] as int? ??
-        data['next_trick_number'] as int?;
-    final obtainedTricks = data['obtainedTricks'] ?? data['obtained_tricks'];
-    final trickCardsPayload = data['trick_cards'] ?? data['trickCards'];
-
-    if (roomId != gameSession.roomId || winnerName == null || winnerName.isEmpty) {
-      return;
-    }
-
-    if (currentTrickNumber != null &&
-        _lastProcessedTrickCompletedNumber == currentTrickNumber) {
-      print('ℹ️ trick_completed #$currentTrickNumber déjà traité — ignoré');
-      return;
-    }
-
-    final logMsg = '📥 Événement trick_completed reçu: winner=$winnerName, trick=$currentTrickNumber';
-    print(logMsg);
-    _addDebugLog(logMsg);
-
-    // 1. Compléter le pli local depuis le payload backend si incomplet
-    if (trickCardsPayload is List && trickCardsPayload.isNotEmpty) {
-      await _syncTrickCardsFromPayload(trickCardsPayload);
-    } else {
-      int attempts = 0;
-      while (attempts < 20 &&
-          cardManager.currentTrick.length < cardManager.expectedPlayerCount) {
-        await Future.delayed(const Duration(milliseconds: 100));
-        attempts++;
-      }
-    }
-
-    // 2. Compteurs depuis le backend (pas d'incrément local)
-    _applyObtainedTricksFromBackend(obtainedTricks);
-
-    if (currentTrickNumber != null) {
-      _lastProcessedTrickCompletedNumber = currentTrickNumber;
-    }
-
-    final isRoundComplete = (nextTrickNumber != null && nextTrickNumber > 13) ||
-        (nextTrickNumber == null &&
-            currentTrickNumber != null &&
-            currentTrickNumber >= 13) ||
-        (currentTrickNumber != null && currentTrickNumber > 13);
-
-    if (isRoundComplete) {
-      print('🎉 Dernier trick terminé ! Manche terminée.');
-      if (mounted) setState(() {});
-      Future.delayed(const Duration(milliseconds: 500), () {
-        if (mounted && !cardManager.isAnnouncementPhase) {
-          onRoundCompleted();
-        }
-      });
-      return;
-    }
-
-    if (mounted) {
-      setState(() {});
-      print('✅ Compteurs synchronisés depuis backend pour trick #$currentTrickNumber');
-    }
-
-    // 3. Animation + nettoyage ; le numéro de pli suivant est appliqué après l'animation
-    await _handleTrickEnd(
-      winnerName,
-      currentTrickNumber,
-      nextTrickNumber: nextTrickNumber,
-    );
-  }
-
-  /// Méthode dédiée pour gérer la fin d'un pli (animation + nettoyage)
-  /// Appelée depuis le listener trick_completed
-  Future<void> _handleTrickEnd(
-    String winnerName,
-    int? trickNumber, {
-    int? nextTrickNumber,
-  }) async {
-    if (!mounted) return;
-
-    final trickCards = cardManager.currentTrick;
-    final logMsg1 = '🎬 _handleTrickEnd: winner=$winnerName, trick=$trickNumber, cartes=${trickCards.length}';
-    print(logMsg1);
-    _addDebugLog(logMsg1);
-
-    // 1. Mettre à jour l'état du gagnant et préparer l'animation
-    if (mounted) {
-      setState(() {
-        lastTrickWinner = winnerName;
-        isCollectingTrick = false; // Commencer avec l'animation désactivée
-      });
-    }
-
-    if (trickCards.isEmpty) {
-      final logMsg2 = '⚠️ Trick vide - impossible de déclencher l\'animation de collecte';
-      print(logMsg2);
-      _addDebugLog(logMsg2);
-      cardManager.clearCurrentTrick();
-      if (nextTrickNumber != null) {
-        cardManager.setCurrentTrickNumber(nextTrickNumber);
-      } else if (trickNumber != null && trickNumber < 13) {
-        cardManager.setCurrentTrickNumber(trickNumber + 1);
-      }
-      cardManager.currentPlayerTurn = winnerName;
-      if (mounted) {
-        setState(() {
-          isCollectingTrick = false;
-          lastTrickWinner = null;
-        });
-      }
-      if (cardManager.currentPlayerTurn == widget.currentPlayerName) {
-        _updatePlayableCardsFromBackend();
-      }
-      Future.delayed(const Duration(milliseconds: 300), () {
-        if (!mounted) return;
-        final current = cardManager.currentPlayerTurn;
-        if (current.isNotEmpty && current != widget.currentPlayerName) {
-          print('🔄 Appel maybeAutoPlayCurrentBot (trick vide)');
-          maybeAutoPlayCurrentBot();
-        }
-      });
-      return;
-    }
-
-    // ✅ Le trick contient des cartes, on peut déclencher l'animation
-    final expectedPlayerCount = cardManager.expectedPlayerCount;
-    final logMsg3 = '🎬 Démarrage animation collecte vers $winnerName (${trickCards.length}/$expectedPlayerCount cartes)';
-    print(logMsg3);
-    _addDebugLog(logMsg3);
-
-    // 2. ✅ ATTENDRE QUE TOUTES LES CARTES SOIENT PRÉSENTES avant de démarrer l'animation
-    // Cela garantit que les 4 cartes sont visibles au centre avant l'animation de collecte
-    Future<void> startCollectionAnimation() async {
-      int attempts = 0;
-      const maxAttempts = 20; // Maximum 2 secondes d'attente (20 * 100ms)
-      const delayMs = 100;
-      
-      while (attempts < maxAttempts) {
-        if (!mounted) return;
-        
-        final currentTrickSize = cardManager.currentTrick.length;
-        final expectedSize = cardManager.expectedPlayerCount;
-        
-        if (currentTrickSize >= expectedSize) {
-          // ✅ Toutes les cartes sont présentes, démarrer l'animation
-          if (mounted) {
-            setState(() {
-              isCollectingTrick = true; // Active l'animation dans _buildCardAtPosition
-            });
-            final logMsg4 = '🎬 Animation collecte activée (${currentTrickSize}/$expectedSize cartes - TOUTES PRÉSENTES)';
-            print(logMsg4);
-            _addDebugLog(logMsg4);
-            
-            // ✅ Log détaillé des cartes présentes
-            final trickCards = cardManager.currentTrick;
-            print('📋 Cartes dans le trick avant animation:');
-            for (int i = 0; i < trickCards.length; i++) {
-              final play = trickCards[i];
-              final player = play['player'] as String? ?? 'Inconnu';
-              final card = play['card'] as Map<String, dynamic>?;
-              final cardCode = card?['code'] as String? ?? 'N/A';
-              print('   [$i] $player → $cardCode');
-            }
-          }
-          return;
-        }
-        
-        attempts++;
-        if (attempts < maxAttempts) {
-          print('⏳ Attente des cartes manquantes: ${currentTrickSize}/$expectedSize (tentative $attempts/$maxAttempts)');
-          await Future.delayed(Duration(milliseconds: delayMs));
-        }
-      }
-      
-      // ⚠️ Timeout: démarrer l'animation même si toutes les cartes ne sont pas arrivées
-      if (mounted) {
-        final finalTrickSize = cardManager.currentTrick.length;
-        print('⚠️ Timeout: Animation démarrée avec $finalTrickSize/$expectedPlayerCount cartes (certaines cartes manquantes)');
-        setState(() {
-          isCollectingTrick = true;
-        });
-      }
-    }
-    
-    // Démarrer la vérification
-    startCollectionAnimation();
-
-    // 3. Après 1200ms (durée de l'animation), nettoyer le trick et passer au suivant
-    // ✅ Remettre la durée d'animation à 1200ms pour une animation fluide
-    Future.delayed(const Duration(milliseconds: 1200), () {
-      if (!mounted) return;
-      
-      // Vider le trick actuel (les cartes ont été animées vers le gagnant)
-      final trickSizeBeforeClear = cardManager.currentTrick.length;
-      cardManager.clearCurrentTrick();
-      final logMsg5 = '🧹 Trick vidé après animation (${trickSizeBeforeClear} cartes supprimées)';
-      print(logMsg5);
-      _addDebugLog(logMsg5);
-
-      // Appliquer le numéro du prochain pli APRÈS l'animation (évite désync visuelle)
-      if (nextTrickNumber != null) {
-        cardManager.setCurrentTrickNumber(nextTrickNumber);
-      } else if (trickNumber != null && trickNumber < 13) {
-        cardManager.setCurrentTrickNumber(trickNumber + 1);
-      }
-
-      cardManager.currentPlayerTurn = winnerName;
-      print('Tour (gagnant du pli): $winnerName');
-
-      if (cardManager.currentPlayerTurn == widget.currentPlayerName) {
-        _updatePlayableCardsFromBackend();
-      }
-      
-      // Mettre à jour l'UI pour cacher l'animation et réinitialiser les variables
-      if (mounted) {
-        setState(() {
-          isCollectingTrick = false;
-          lastTrickWinner = null;
-        });
-        print('✅ UI mise à jour: animation terminée, trick nettoyé');
-      }
-
-      if (cardManager.isRoundEnding || cardManager.allCardsPlayed()) {
-        cardManager.advanceToNextPlayerWithCards(preferredStart: winnerName);
-        tryCompleteRoundIfFinished();
-        return;
-      }
-
-      cardManager.advanceToNextPlayerWithCards(preferredStart: winnerName);
-
-      // ✅ Augmenter le délai pour laisser le temps au backend de créer le nouveau trick
-      Future.delayed(const Duration(milliseconds: 1500), () async {
-        if (!mounted || !shouldAllowAutoPlay()) {
-          if (mounted &&
-              (cardManager.isRoundEnding || cardManager.allCardsPlayed())) {
-            tryCompleteRoundIfFinished();
-          }
-          return;
-        }
-        final current = cardManager.currentPlayerTurn;
-        if (current.isNotEmpty && current != widget.currentPlayerName) {
-          print('🔄 Appel maybeAutoPlayCurrentBot après nettoyage trick (délai 1.5s)');
-          
-          // ✅ Vérifier que le nouveau trick est prêt avant de jouer
-          try {
-            final roomId = gameSession.roomId;
-            if (roomId != null && roomId.isNotEmpty) {
-              final roundNumber = gameSession.currentRound;
-              final trickNumber = cardManager.currentTrickNumber > 0 
-                  ? cardManager.currentTrickNumber 
-                  : 1;
-              
-              // Vérifier que le trick est prêt
-              final trickData = await GameApiService.instance.getCurrentTrick(
-                roomId: roomId,
-                roundNumber: roundNumber,
-                trickNumber: trickNumber,
-              );
-              
-              if (trickData['success'] == true) {
-                print('✅ Nouveau trick prêt, le bot peut jouer');
-                scheduleMaybeAutoPlayCurrentBot();
-              } else {
-                // ✅ Erreur 409 - le trick n'est pas encore prêt, attendre plus longtemps
-                final errorMessage = trickData['message']?.toString() ?? '';
-                if (errorMessage.contains('Trick not ready yet') || errorMessage.contains('409')) {
-                  print('⏳ Trick pas encore prêt (409), attente de 1.5s avant nouvelle tentative...');
-                  Future.delayed(const Duration(milliseconds: 1500), () {
-                    if (mounted) scheduleMaybeAutoPlayCurrentBot();
-                  });
-                } else {
-                  print('⚠️ Erreur lors de la vérification du trick: $errorMessage');
-                  Future.delayed(const Duration(milliseconds: 500), () {
-                    if (mounted) scheduleMaybeAutoPlayCurrentBot();
-                  });
-                }
-              }
-          } else {
-            Future.delayed(const Duration(milliseconds: 500), () {
-              if (mounted) scheduleMaybeAutoPlayCurrentBot();
-            });
-          }
-        } catch (e) {
-          print('⚠️ Erreur lors de la vérification du trick: $e');
-          final errorString = e.toString();
-          if (errorString.contains('Trick not ready yet') || errorString.contains('409')) {
-            print('⏳ Trick pas encore prêt (exception 409), attente de 1.5s...');
-            Future.delayed(const Duration(milliseconds: 1500), () {
-              if (mounted) scheduleMaybeAutoPlayCurrentBot();
-            });
-          } else {
-            Future.delayed(const Duration(milliseconds: 500), () {
-              if (mounted) scheduleMaybeAutoPlayCurrentBot();
-            });
-          }
-        }
-        }
-      });
-    });
-  }
 
     // ✅ Écouter trick_completed : resync cartes + compteurs backend, puis animation
     _trickCompletedSubscription = wsService.onTrickCompleted().listen((data) {
@@ -3346,6 +2876,477 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     }
   }
 
+
+  /// Méthode utilitaire pour ajouter un log de débogage (pour l'UI et la console)
+  void _addDebugLog(String log) {
+    if (!kDebugMode) return;
+
+    final timestamp = DateTime.now().toIso8601String().substring(11, 23); // HH:mm:ss.sss
+
+    final formattedLog = '[$timestamp] $log';
+
+    if (mounted) {
+      setState(() {
+        _debugLogs.insert(0, formattedLog); // Ajouter au début
+        if (_debugLogs.length > _maxLogs) {
+          _debugLogs.removeLast(); // Maintenir la taille max
+        }
+      });
+    }
+  }
+
+  /// Implémentation de la méthode abstraite:
+  /// Récupère la liste des codes de cartes jouables pour le joueur actuel depuis le backend.
+  @override
+  Future<void> _updatePlayableCardsFromBackend({bool force = false}) async {
+    if (_isUpdatingPlayableCards && !force) {
+      _addDebugLog('⚠️ Déjà en cours de mise à jour des cartes jouables (force=false). Ignoré.');
+      return;
+    }
+    _addDebugLog('🔄 Début de la mise à jour des cartes jouables (force=$force)...');
+    
+    setState(() {
+      _isUpdatingPlayableCards = true;
+    });
+
+    final currentRoomId = gameSession.roomId;
+    if (currentRoomId == null || currentRoomId.isEmpty) {
+      _addDebugLog('❌ Room ID est null/vide. Impossible de récupérer les cartes jouables.');
+      setState(() {
+        _isUpdatingPlayableCards = false;
+      });
+      return;
+    }
+
+    try {
+      // Obtenir les IDs nécessaires pour l'API
+      final gameId = await getGameId();
+      final roundId = await getRoundIdForCurrentRound();
+      final trickId = await getTrickIdForCurrentTrick();
+      final playerId = await getPlayerId(widget.currentPlayerName);
+      
+      if (gameId != null && roundId != null && trickId != null && playerId != null) {
+        final playableCardCodesList = await GameApiService.instance.getPlayableCards(
+          gameId: gameId,
+          roundId: roundId,
+          trickId: trickId,
+          playerId: playerId,
+        );
+        
+        final playableCardCodes = playableCardCodesList.toSet();
+        final message = '✅ Cartes jouables mises à jour : ${playableCardCodes.length} cartes. Codes: ${playableCardCodes.take(5).join(', ')}...';
+        _addDebugLog(message);
+        print(message); // Console log
+
+        setState(() {
+          _playableCardCodes = playableCardCodes;
+          _isUpdatingPlayableCards = false;
+        });
+      } else {
+        final errorMsg = '❌ IDs non disponibles (gameId=$gameId, roundId=$roundId, trickId=$trickId, playerId=$playerId)';
+        _addDebugLog(errorMsg);
+        print(errorMsg);
+        setState(() {
+          _playableCardCodes.clear();
+          _isUpdatingPlayableCards = false;
+        });
+      }
+    } catch (e) {
+      final errorMsg = '❌ Erreur lors de la récupération des cartes jouables: $e';
+      _addDebugLog(errorMsg);
+      print(errorMsg); // Console log
+      if (mounted) {
+        setState(() {
+          _playableCardCodes.clear();
+          _isUpdatingPlayableCards = false;
+        });
+      }
+    }
+  }
+
+  // ✅ Méthode publique helper pour être accessible dans les closures
+  Future<void> updatePlayableCardsFromBackend() async {
+    return _updatePlayableCardsFromBackend();
+  }
+
+  int? _lastProcessedTrickCompletedNumber;
+
+  /// Construit une carte jouable à partir d'un code (ex: 7H, AS).
+  Map<String, dynamic> _cardMapFromCode(String cardCode) {
+    final code = cardCode.toUpperCase();
+    final suitShort = code.substring(code.length - 1);
+    final valueShort = code.substring(0, code.length - 1);
+    const suitMapping = {
+      'S': 'SPADES',
+      'C': 'CLUBS',
+      'H': 'HEARTS',
+      'D': 'DIAMONDS',
+    };
+    const valueMapping = {
+      'A': 'ACE',
+      'K': 'KING',
+      'Q': 'QUEEN',
+      'J': 'JACK',
+      '0': '10',
+    };
+    final suitName = suitMapping[suitShort] ?? suitShort;
+    final valueName = valueMapping[valueShort] ?? valueShort;
+    return {
+      'code': code,
+      'suit': suitName,
+      'value': valueName,
+      'image': 'assets/images/cards/${suitName.toLowerCase()}_$valueName.png',
+    };
+  }
+
+  /// Synchronise le pli local avec les cartes envoyées par le backend.
+  Future<void> _syncTrickCardsFromPayload(List<dynamic> trickCardsPayload) async {
+    for (final raw in trickCardsPayload) {
+      if (raw is! Map) continue;
+      final playerName = (raw['player_name'] ?? raw['playerName']) as String?;
+      final cardCode = ((raw['card_code'] ?? raw['cardCode']) as String?)?.toUpperCase();
+      if (playerName == null || cardCode == null || cardCode.isEmpty) continue;
+
+      final alreadyPresent = cardManager.currentTrick.any((entry) {
+        final entryPlayer = entry['player'] as String?;
+        final entryCard = entry['card'] as Map<String, dynamic>?;
+        return entryPlayer == playerName &&
+            (entryCard?['code'] as String?)?.toUpperCase() == cardCode;
+      });
+      if (alreadyPresent) continue;
+
+      print('🔄 Resync trick: ajout $cardCode pour $playerName (payload backend)');
+      cardManager.addCardToTrick(playerName, _cardMapFromCode(cardCode));
+    }
+  }
+
+  /// Applique les compteurs de plis depuis le backend (source de vérité).
+  void _applyObtainedTricksFromBackend(dynamic obtainedTricksRaw) {
+    if (obtainedTricksRaw == null) return;
+
+    Map<String, dynamic> obtainedMap;
+    if (obtainedTricksRaw is Map) {
+      obtainedMap = Map<String, dynamic>.from(obtainedTricksRaw);
+    } else if (obtainedTricksRaw is List) {
+      print('⚠️ obtained_tricks reçu comme List, conversion ignorée');
+      return;
+    } else {
+      return;
+    }
+
+    for (final entry in obtainedMap.entries) {
+      final playerName = entry.key;
+      final count = (entry.value as num?)?.toInt() ?? 0;
+      cardManager.setObtainedTricks(playerName, count);
+      print('📊 Compteur backend: $playerName → $count plis');
+    }
+  }
+
+  /// Traite trick_completed : resync cartes, compteurs backend, puis animation.
+  Future<void> _onTrickCompletedFromWebSocket(Map<String, dynamic> data) async {
+    if (!mounted) return;
+
+    final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
+    final winnerName = data['winnerName'] as String? ?? data['winner_name'] as String?;
+    final currentTrickNumber = data['currentTrickNumber'] as int? ??
+        data['current_trick_number'] as int?;
+    final nextTrickNumber = data['nextTrickNumber'] as int? ??
+        data['next_trick_number'] as int?;
+    final obtainedTricks = data['obtainedTricks'] ?? data['obtained_tricks'];
+    final trickCardsPayload = data['trick_cards'] ?? data['trickCards'];
+
+    if (roomId != gameSession.roomId || winnerName == null || winnerName.isEmpty) {
+      return;
+    }
+
+    if (currentTrickNumber != null &&
+        _lastProcessedTrickCompletedNumber == currentTrickNumber) {
+      print('ℹ️ trick_completed #$currentTrickNumber déjà traité — ignoré');
+      return;
+    }
+
+    final logMsg = '📥 Événement trick_completed reçu: winner=$winnerName, trick=$currentTrickNumber';
+    print(logMsg);
+    _addDebugLog(logMsg);
+
+    // 1. Compléter le pli local depuis le payload backend si incomplet
+    if (trickCardsPayload is List && trickCardsPayload.isNotEmpty) {
+      await _syncTrickCardsFromPayload(trickCardsPayload);
+    } else {
+      int attempts = 0;
+      while (attempts < 20 &&
+          cardManager.currentTrick.length < cardManager.expectedPlayerCount) {
+        await Future.delayed(const Duration(milliseconds: 100));
+        attempts++;
+      }
+    }
+
+    // 2. Compteurs depuis le backend (pas d'incrément local)
+    _applyObtainedTricksFromBackend(obtainedTricks);
+
+    if (currentTrickNumber != null) {
+      _lastProcessedTrickCompletedNumber = currentTrickNumber;
+    }
+
+    final isRoundComplete = (nextTrickNumber != null && nextTrickNumber > 13) ||
+        (nextTrickNumber == null &&
+            currentTrickNumber != null &&
+            currentTrickNumber >= 13) ||
+        (currentTrickNumber != null && currentTrickNumber > 13);
+
+    if (isRoundComplete) {
+      print('🎉 Dernier trick terminé ! Manche terminée.');
+      if (mounted) setState(() {});
+      Future.delayed(const Duration(milliseconds: 500), () {
+        if (mounted && !cardManager.isAnnouncementPhase) {
+          onRoundCompleted();
+        }
+      });
+      return;
+    }
+
+    if (mounted) {
+      setState(() {});
+      print('✅ Compteurs synchronisés depuis backend pour trick #$currentTrickNumber');
+    }
+
+    // 3. Animation + nettoyage ; le numéro de pli suivant est appliqué après l'animation
+    await _handleTrickEnd(
+      winnerName,
+      currentTrickNumber,
+      nextTrickNumber: nextTrickNumber,
+    );
+  }
+
+  /// Méthode dédiée pour gérer la fin d'un pli (animation + nettoyage)
+  /// Appelée depuis le listener trick_completed
+  Future<void> _handleTrickEnd(
+    String winnerName,
+    int? trickNumber, {
+    int? nextTrickNumber,
+  }) async {
+    if (!mounted) return;
+
+    final trickCards = cardManager.currentTrick;
+    final logMsg1 = '🎬 _handleTrickEnd: winner=$winnerName, trick=$trickNumber, cartes=${trickCards.length}';
+    print(logMsg1);
+    _addDebugLog(logMsg1);
+
+    // 1. Mettre à jour l'état du gagnant et préparer l'animation
+    if (mounted) {
+      setState(() {
+        lastTrickWinner = winnerName;
+        isCollectingTrick = false; // Commencer avec l'animation désactivée
+      });
+    }
+
+    if (trickCards.isEmpty) {
+      final logMsg2 = '⚠️ Trick vide - impossible de déclencher l\'animation de collecte';
+      print(logMsg2);
+      _addDebugLog(logMsg2);
+      cardManager.clearCurrentTrick();
+      if (nextTrickNumber != null) {
+        cardManager.setCurrentTrickNumber(nextTrickNumber);
+      } else if (trickNumber != null && trickNumber < 13) {
+        cardManager.setCurrentTrickNumber(trickNumber + 1);
+      }
+      cardManager.currentPlayerTurn = winnerName;
+      if (mounted) {
+        setState(() {
+          isCollectingTrick = false;
+          lastTrickWinner = null;
+        });
+      }
+      if (cardManager.currentPlayerTurn == widget.currentPlayerName) {
+        _updatePlayableCardsFromBackend();
+      }
+      Future.delayed(const Duration(milliseconds: 300), () {
+        if (!mounted) return;
+        final current = cardManager.currentPlayerTurn;
+        if (current.isNotEmpty && current != widget.currentPlayerName) {
+          print('🔄 Appel maybeAutoPlayCurrentBot (trick vide)');
+          maybeAutoPlayCurrentBot();
+        }
+      });
+      return;
+    }
+
+    // ✅ Le trick contient des cartes, on peut déclencher l'animation
+    final expectedPlayerCount = cardManager.expectedPlayerCount;
+    final logMsg3 = '🎬 Démarrage animation collecte vers $winnerName (${trickCards.length}/$expectedPlayerCount cartes)';
+    print(logMsg3);
+    _addDebugLog(logMsg3);
+
+    // 2. ✅ ATTENDRE QUE TOUTES LES CARTES SOIENT PRÉSENTES avant de démarrer l'animation
+    // Cela garantit que les 4 cartes sont visibles au centre avant l'animation de collecte
+    Future<void> startCollectionAnimation() async {
+      int attempts = 0;
+      const maxAttempts = 20; // Maximum 2 secondes d'attente (20 * 100ms)
+      const delayMs = 100;
+      
+      while (attempts < maxAttempts) {
+        if (!mounted) return;
+        
+        final currentTrickSize = cardManager.currentTrick.length;
+        final expectedSize = cardManager.expectedPlayerCount;
+        
+        if (currentTrickSize >= expectedSize) {
+          // ✅ Toutes les cartes sont présentes, démarrer l'animation
+          if (mounted) {
+            setState(() {
+              isCollectingTrick = true; // Active l'animation dans _buildCardAtPosition
+            });
+            final logMsg4 = '🎬 Animation collecte activée (${currentTrickSize}/$expectedSize cartes - TOUTES PRÉSENTES)';
+            print(logMsg4);
+            _addDebugLog(logMsg4);
+            
+            // ✅ Log détaillé des cartes présentes
+            final trickCards = cardManager.currentTrick;
+            print('📋 Cartes dans le trick avant animation:');
+            for (int i = 0; i < trickCards.length; i++) {
+              final play = trickCards[i];
+              final player = play['player'] as String? ?? 'Inconnu';
+              final card = play['card'] as Map<String, dynamic>?;
+              final cardCode = card?['code'] as String? ?? 'N/A';
+              print('   [$i] $player → $cardCode');
+            }
+          }
+          return;
+        }
+        
+        attempts++;
+        if (attempts < maxAttempts) {
+          print('⏳ Attente des cartes manquantes: ${currentTrickSize}/$expectedSize (tentative $attempts/$maxAttempts)');
+          await Future.delayed(Duration(milliseconds: delayMs));
+        }
+      }
+      
+      // ⚠️ Timeout: démarrer l'animation même si toutes les cartes ne sont pas arrivées
+      if (mounted) {
+        final finalTrickSize = cardManager.currentTrick.length;
+        print('⚠️ Timeout: Animation démarrée avec $finalTrickSize/$expectedPlayerCount cartes (certaines cartes manquantes)');
+        setState(() {
+          isCollectingTrick = true;
+        });
+      }
+    }
+    
+    // Démarrer la vérification
+    startCollectionAnimation();
+
+    // 3. Après 1200ms (durée de l'animation), nettoyer le trick et passer au suivant
+    // ✅ Remettre la durée d'animation à 1200ms pour une animation fluide
+    Future.delayed(const Duration(milliseconds: 1200), () {
+      if (!mounted) return;
+      
+      // Vider le trick actuel (les cartes ont été animées vers le gagnant)
+      final trickSizeBeforeClear = cardManager.currentTrick.length;
+      cardManager.clearCurrentTrick();
+      final logMsg5 = '🧹 Trick vidé après animation (${trickSizeBeforeClear} cartes supprimées)';
+      print(logMsg5);
+      _addDebugLog(logMsg5);
+
+      // Appliquer le numéro du prochain pli APRÈS l'animation (évite désync visuelle)
+      if (nextTrickNumber != null) {
+        cardManager.setCurrentTrickNumber(nextTrickNumber);
+      } else if (trickNumber != null && trickNumber < 13) {
+        cardManager.setCurrentTrickNumber(trickNumber + 1);
+      }
+
+      cardManager.currentPlayerTurn = winnerName;
+      print('Tour (gagnant du pli): $winnerName');
+
+      if (cardManager.currentPlayerTurn == widget.currentPlayerName) {
+        _updatePlayableCardsFromBackend();
+      }
+      
+      // Mettre à jour l'UI pour cacher l'animation et réinitialiser les variables
+      if (mounted) {
+        setState(() {
+          isCollectingTrick = false;
+          lastTrickWinner = null;
+        });
+        print('✅ UI mise à jour: animation terminée, trick nettoyé');
+      }
+
+      if (cardManager.isRoundEnding || cardManager.allCardsPlayed()) {
+        cardManager.advanceToNextPlayerWithCards(preferredStart: winnerName);
+        tryCompleteRoundIfFinished();
+        return;
+      }
+
+      cardManager.advanceToNextPlayerWithCards(preferredStart: winnerName);
+
+      // ✅ Augmenter le délai pour laisser le temps au backend de créer le nouveau trick
+      Future.delayed(const Duration(milliseconds: 1500), () async {
+        if (!mounted || !shouldAllowAutoPlay()) {
+          if (mounted &&
+              (cardManager.isRoundEnding || cardManager.allCardsPlayed())) {
+            tryCompleteRoundIfFinished();
+          }
+          return;
+        }
+        final current = cardManager.currentPlayerTurn;
+        if (current.isNotEmpty && current != widget.currentPlayerName) {
+          print('🔄 Appel maybeAutoPlayCurrentBot après nettoyage trick (délai 1.5s)');
+          
+          // ✅ Vérifier que le nouveau trick est prêt avant de jouer
+          try {
+            final roomId = gameSession.roomId;
+            if (roomId != null && roomId.isNotEmpty) {
+              final roundNumber = gameSession.currentRound;
+              final trickNumber = cardManager.currentTrickNumber > 0 
+                  ? cardManager.currentTrickNumber 
+                  : 1;
+              
+              // Vérifier que le trick est prêt
+              final trickData = await GameApiService.instance.getCurrentTrick(
+                roomId: roomId,
+                roundNumber: roundNumber,
+                trickNumber: trickNumber,
+              );
+              
+              if (trickData['success'] == true) {
+                print('✅ Nouveau trick prêt, le bot peut jouer');
+                scheduleMaybeAutoPlayCurrentBot();
+              } else {
+                // ✅ Erreur 409 - le trick n'est pas encore prêt, attendre plus longtemps
+                final errorMessage = trickData['message']?.toString() ?? '';
+                if (errorMessage.contains('Trick not ready yet') || errorMessage.contains('409')) {
+                  print('⏳ Trick pas encore prêt (409), attente de 1.5s avant nouvelle tentative...');
+                  Future.delayed(const Duration(milliseconds: 1500), () {
+                    if (mounted) scheduleMaybeAutoPlayCurrentBot();
+                  });
+                } else {
+                  print('⚠️ Erreur lors de la vérification du trick: $errorMessage');
+                  Future.delayed(const Duration(milliseconds: 500), () {
+                    if (mounted) scheduleMaybeAutoPlayCurrentBot();
+                  });
+                }
+              }
+          } else {
+            Future.delayed(const Duration(milliseconds: 500), () {
+              if (mounted) scheduleMaybeAutoPlayCurrentBot();
+            });
+          }
+        } catch (e) {
+          print('⚠️ Erreur lors de la vérification du trick: $e');
+          final errorString = e.toString();
+          if (errorString.contains('Trick not ready yet') || errorString.contains('409')) {
+            print('⏳ Trick pas encore prêt (exception 409), attente de 1.5s...');
+            Future.delayed(const Duration(milliseconds: 1500), () {
+              if (mounted) scheduleMaybeAutoPlayCurrentBot();
+            });
+          } else {
+            Future.delayed(const Duration(milliseconds: 500), () {
+              if (mounted) scheduleMaybeAutoPlayCurrentBot();
+            });
+          }
+        }
+        }
+      });
+    });
+  }
   /// Un seul timer HTTP pour la salle (remplace room + state sync doublons).
   void _restartRoomSyncPolling({bool forceRestart = false}) {
     if (gameSession.playWithBots) return;
