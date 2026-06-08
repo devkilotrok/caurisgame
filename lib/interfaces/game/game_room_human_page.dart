@@ -1743,16 +1743,18 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     hasGameStarted = true;
   }
 
+  /// Seul le créateur pilote les bots via l'API ; les autres clients affichent le WS.
+  @override
+  void maybeAutoPlayCurrentBot() {
+    if (!gameSession.playWithBots && !_isRoomCreator) {
+      return;
+    }
+    super.maybeAutoPlayCurrentBot();
+  }
+
   // Surcharger playCard pour ajouter l'envoi WebSocket
   @override
   Future<void> playCard(Map<String, dynamic> card) async {
-    // ✅ Vérifier si le joueur est déjà en train de jouer (protection contre les clics multiples)
-    if (currentPlayerPlaying != null) {
-      print('⚠️ Le joueur est déjà en train de jouer, ignorer le clic');
-      return;
-    }
-    
-    // ✅ Appeler la méthode de base (qui fera la validation puis le verrouillage)
     await super.playCard(card);
   }
 

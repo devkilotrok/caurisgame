@@ -270,8 +270,13 @@ class GameLogic {
     List<Map<String, dynamic>> playerCards
   ) {
     final playableCards = getPlayableCards(playerCards, playerName, _currentTrick.isEmpty);
-    
-    if (!playableCards.contains(card)) {
+    final cardCode = (card['code'] as String?)?.toUpperCase() ?? '';
+    final isPlayable = cardCode.isNotEmpty &&
+        playableCards.any(
+          (c) => ((c['code'] as String?)?.toUpperCase() ?? '') == cardCode,
+        );
+
+    if (!isPlayable) {
       return {
         'success': false,
         'message': 'Carte non jouable',

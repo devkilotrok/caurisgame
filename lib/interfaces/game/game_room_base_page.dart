@@ -1081,8 +1081,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     }
     print('🎴 ${widget.currentPlayerName} commence à jouer la carte ${card['code']}');
     
-    // ✅ Appeler directement l'API Laravel (pas d'animation locale avant)
-    // Le backend gère tout : validation, diffusion WebSocket, animation via card_played
+    gameLogic.syncCurrentTrick(cardManager.currentTrick);
     final result = gameLogic.playCard(
       card,
       widget.currentPlayerName,
@@ -1090,15 +1089,19 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     );
 
     if (result['success'] == true) {
-      // ✅ Appeler l'API Laravel qui gère tout (détection 4ème carte, calcul gagnant, délai)
       await _playCardViaLaravelAPI(
         card,
         result,
         playerName: widget.currentPlayerName,
       );
     } else {
-      // ✅ Libérer le flag si le résultat n'est pas success
-      currentPlayerPlaying = null;
+      // Backend a validé la carte — ne pas bloquer sur la logique locale désynchronisée
+      print('⚠️ gameLogic local a refusé ${card['code']} — envoi API quand même (backend OK)');
+      await _playCardViaLaravelAPI(
+        card,
+        {'success': true, 'trickComplete': false, 'message': 'Backend validated'},
+        playerName: widget.currentPlayerName,
+      );
     }
   }
 
@@ -1276,7 +1279,11 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       // 4. ✅ Pour les joueurs locaux, attendre que l'animation soit terminée avant d'ajouter la carte au trick
       // Cela garantit que la carte n'apparaît pas au centre avant la fin de l'animation
       if (isLocalPlayer && animationCompleter != null) {
-        await animationCompleter.future;
+        try {
+          await animationCompleter.future.timeout(const Duration(seconds: 4));
+        } on TimeoutException {
+          print('⚠️ Animation timeout (4s) — poursuite du jeu');
+        }
       }
 
       // 5. ✅ Pour TOUS les joueurs (locaux et bots), ajouter la carte au trick APRÈS confirmation du backend
@@ -1512,12 +1519,9 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
           }
         });
         
-        // Ne pas libérer le flag immédiatement - on attend le retry
-        return; // Sortir pour éviter d'afficher un message d'erreur
+        currentPlayerPlaying = null;
+        return;
       }
-      
-      // ✅ Libérer le flag pour permettre de réessayer
-      currentPlayerPlaying = null;
       
       if (mounted) {
         if (isValidationError) {
@@ -1551,6 +1555,10 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
         // Donc pas besoin de la remettre en cas d'erreur - elle est toujours dans la main du joueur
         
         setState(() {});
+      }
+    } finally {
+      if (currentPlayerPlaying == effectivePlayerName) {
+        currentPlayerPlaying = null;
       }
     }
   }
@@ -2035,6 +2043,11 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       return;
     }
 
+    // Ne démarrer le timer que pour le joueur local (humain sur cet appareil)
+    if (currentPlayer != widget.currentPlayerName) {
+      return;
+    }
+
     // Ne pas démarrer le timer pour les bots (ils jouent automatiquement)
     if (!gameSession.playWithBots) {
       final playerInfo = gameSession.players.firstWhere(
@@ -2046,11 +2059,6 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       final isBot = isBotValue == true || isBotValue == 1 || (isBotValue is String && isBotValue == '1');
       final isReplacementBot = isReplacementBotValue == true || isReplacementBotValue == 1 || (isReplacementBotValue is String && isReplacementBotValue == '1');
       if (isBot || isReplacementBot) {
-        return; // Les bots jouent automatiquement, pas besoin de timer
-      }
-    } else {
-      // En mode bot, ne pas démarrer le timer si ce n'est pas le joueur local
-      if (currentPlayer != widget.currentPlayerName) {
         return;
       }
     }
