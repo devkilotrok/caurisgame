@@ -129,6 +129,14 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
   set isProcessingRoundCompletion(bool value) =>
       _isProcessingRoundCompletion = value;
 
+  /// En multijoueur humain, les bots sont pilotés par le serveur (PlayBotTurnJob).
+  @protected
+  bool get serverDrivesBots => false;
+
+  /// Hook avant validation backend d'une carte (resync pli, etc.).
+  @protected
+  Future<void> beforePlayCardValidation() async {}
+
   /// Bloque l'auto-play quand la manche est finie ou en cours de finalisation.
   @protected
   bool shouldAllowAutoPlay() {
@@ -141,7 +149,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
 
   @protected
   void scheduleMaybeAutoPlayCurrentBot() {
-    if (!shouldAllowAutoPlay()) return;
+    if (serverDrivesBots || !shouldAllowAutoPlay()) return;
     maybeAutoPlayCurrentBot();
   }
 
@@ -991,15 +999,17 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
 
     // ✅ NOUVEAU: Valider les cartes jouables depuis le backend
     try {
+      await beforePlayCardValidation();
+
       // Obtenir gameId, roundId, trickId et playerId
       final gameId = await getGameId();
       final roundId = await getRoundIdForCurrentRound();
-      final trickId = await getTrickIdForCurrentTrick();
+      var trickId = await getTrickIdForCurrentTrick();
       final playerId = await getPlayerId(widget.currentPlayerName);
 
       if (gameId != null && roundId != null && trickId != null && playerId != null) {
         // Appeler le backend pour obtenir les cartes jouables
-        final playableCardCodes = await GameApiService.instance.getPlayableCards(
+        var playableCardCodes = await GameApiService.instance.getPlayableCards(
           gameId: gameId,
           roundId: roundId,
           trickId: trickId,
@@ -1008,6 +1018,20 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
 
         // Vérifier si la carte est jouable
         final cardCode = card['code'] as String;
+        if (!playableCardCodes.contains(cardCode) && serverDrivesBots) {
+          print('⚠️ Carte $cardCode refusée — resync pli puis nouvelle tentative');
+          await beforePlayCardValidation();
+          trickId = await getTrickIdForCurrentTrick();
+          if (trickId != null) {
+            playableCardCodes = await GameApiService.instance.getPlayableCards(
+              gameId: gameId,
+              roundId: roundId,
+              trickId: trickId,
+              playerId: playerId,
+            );
+          }
+        }
+
         if (!playableCardCodes.contains(cardCode)) {
           currentPlayerPlaying = null;
           ScaffoldMessenger.of(context).showSnackBar(
@@ -1773,6 +1797,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
 
   // Si c'est un bot, jouer automatiquement une carte valide
   void maybeAutoPlayCurrentBot() async {
+    if (serverDrivesBots) return;
     if (!mounted) {
       print('⚠️ maybeAutoPlayCurrentBot: widget non monté - ignoré');
       return;

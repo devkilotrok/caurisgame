@@ -491,10 +491,20 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         roomId: roomId,
         lastChatId: _lastChatMessageId,
       );
-      final data = Map<String, dynamic>.from(
-        (res['data'] as Map?) ?? res as Map,
-      );
-      final round = data['round'] as Map<String, dynamic>?;
+      final rawData = res['data'];
+      final Map<String, dynamic> data;
+      if (rawData is Map) {
+        data = Map<String, dynamic>.from(rawData);
+      } else if (res is Map) {
+        data = Map<String, dynamic>.from(res);
+      } else {
+        print('⚠️ sync distribution: payload inattendu (${rawData.runtimeType})');
+        return;
+      }
+      final roundRaw = data['round'];
+      final round = roundRaw is Map
+          ? Map<String, dynamic>.from(roundRaw)
+          : null;
       final distributed = round?['distributed_cards'];
       final hasCards = distributed is Map && distributed.isNotEmpty;
       print(
@@ -549,7 +559,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
   String? _backendPlayFirstPlayer;
 
-  Timer? _botPlayFallbackTimer;
+  @override
+  bool get serverDrivesBots => !gameSession.playWithBots;
 
   bool get _isRoomCreator => gameSession.players.any(
         (p) =>
@@ -571,28 +582,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           isReplacementBotValue == 1 ||
           (isReplacementBotValue is String && isReplacementBotValue == '1');
       return isBot || isReplacementBot;
-    });
-  }
-
-  void _scheduleBotPlayFallback() {
-    if (gameSession.playWithBots) return;
-    final botName = cardManager.currentPlayerTurn;
-    if (!_isBotPlayerName(botName)) return;
-
-    _botPlayFallbackTimer?.cancel();
-    _botPlayFallbackTimer = Timer(const Duration(milliseconds: 2500), () {
-      if (!mounted || !shouldAllowAutoPlay()) return;
-      if (cardManager.currentPlayerTurn != botName) return;
-      if (!_isBotPlayerName(botName)) return;
-
-      final alreadyPlayed = cardManager.currentTrick.any(
-        (e) => (e['player'] as String?) == botName,
-      );
-      if (alreadyPlayed) return;
-      if (currentPlayerPlaying != null) return;
-
-      print('⚠️ Fallback bot: $botName joue via API (créateur inactif)');
-      super.maybeAutoPlayCurrentBot();
     });
   }
 
@@ -1783,23 +1772,12 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     hasGameStarted = true;
   }
 
-  /// Seul le créateur pilote les bots en priorité ; fallback si le bot ne joue pas.
   @override
-  void maybeAutoPlayCurrentBot() {
-    if (!gameSession.playWithBots && !_isRoomCreator) {
-      _scheduleBotPlayFallback();
-      return;
+  Future<void> beforePlayCardValidation() async {
+    if (serverDrivesBots) {
+      await _resyncCurrentTrickFromBackend();
     }
-    _botPlayFallbackTimer?.cancel();
-    super.maybeAutoPlayCurrentBot();
   }
-
-  // Surcharger playCard pour ajouter l'envoi WebSocket
-  @override
-  Future<void> playCard(Map<String, dynamic> card) async {
-    await super.playCard(card);
-  }
-
 
   // Surcharger sendRoundCompletedViaWebSocket pour envoyer via WebSocket
   @override
@@ -2628,30 +2606,25 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         cardManager.currentPlayerTurn = currentPlayerName;
         
         if (mounted) {
-          // ✅ Mettre à jour les cartes jouables quand c'est le tour du joueur local
           if (currentPlayerName == widget.currentPlayerName) {
-            _updatePlayableCardsFromBackend();
+            if (serverDrivesBots) {
+              unawaited(_resyncCurrentTrickFromBackend().then((_) {
+                if (mounted) _updatePlayableCardsFromBackend();
+              }));
+            } else {
+              _updatePlayableCardsFromBackend();
+            }
           }
           setState(() {});
-          
-          // ✅ Démarrer le timer de timeout de 15 secondes pour le joueur actuel
+
           startPlayerTurnTimeout();
-          
-          // ✅ Si c'est le tour d'un bot, déclencher le jeu automatique
-          // Mais seulement si aucun joueur n'est déjà en train de jouer
-          print('🔍 turn_changed: Vérification si $currentPlayerName est un bot...');
-          if (currentPlayerPlaying == null) {
-            print('   ✅ Aucun joueur en train de jouer, déclenchement maybeAutoPlayCurrentBot() dans 300ms');
+
+          if (!serverDrivesBots && currentPlayerPlaying == null) {
             Future.delayed(const Duration(milliseconds: 300), () {
               if (mounted && currentPlayerPlaying == null) {
-                print('   ✅ Appel de maybeAutoPlayCurrentBot() après délai');
                 maybeAutoPlayCurrentBot();
-              } else {
-                print('   ⚠️ maybeAutoPlayCurrentBot() annulé: mounted=$mounted, currentPlayerPlaying=$currentPlayerPlaying');
               }
             });
-          } else {
-            print('   ⚠️ maybeAutoPlayCurrentBot() ignoré: $currentPlayerPlaying est déjà en train de jouer');
           }
         }
       }
@@ -3043,6 +3016,57 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     };
   }
 
+  /// Resynchronise le pli et le tour depuis GET get-current-trick (source de vérité).
+  Future<void> _resyncCurrentTrickFromBackend() async {
+    final roomId = gameSession.roomId;
+    if (roomId == null || roomId.isEmpty) return;
+
+    try {
+      final roundNumber = _effectiveRoundNumber();
+      final trickNumber = cardManager.currentTrickNumber > 0
+          ? cardManager.currentTrickNumber
+          : 1;
+
+      final trickData = await GameApiService.instance.getCurrentTrick(
+        roomId: roomId,
+        roundNumber: roundNumber,
+        trickNumber: trickNumber,
+      );
+
+      if (trickData['success'] != true) return;
+
+      final rawData = trickData['data'];
+      if (rawData is! Map) return;
+      final data = Map<String, dynamic>.from(rawData);
+
+      final backendTrickNumber = (data['trick_number'] as num?)?.toInt();
+      if (backendTrickNumber != null &&
+          backendTrickNumber != cardManager.currentTrickNumber) {
+        cardManager.setCurrentTrickNumber(backendTrickNumber);
+      }
+
+      final currentTurn = data['current_turn'];
+      if (currentTurn is Map) {
+        final name = (currentTurn['player_name'] ?? currentTurn['playerName'])
+            as String?;
+        if (name != null && name.isNotEmpty) {
+          cardManager.currentPlayerTurn = name;
+        }
+      }
+
+      final playedRaw = data['played_cards'];
+      if (playedRaw is List) {
+        if (playedRaw.length != cardManager.currentTrick.length) {
+          cardManager.clearCurrentTrick();
+        }
+        await _syncTrickCardsFromPayload(playedRaw);
+        gameLogic.syncCurrentTrick(cardManager.currentTrick);
+      }
+    } catch (e) {
+      print('⚠️ resync trick: $e');
+    }
+  }
+
   /// Synchronise le pli local avec les cartes envoyées par le backend.
   Future<void> _syncTrickCardsFromPayload(List<dynamic> trickCardsPayload) async {
     for (final raw in trickCardsPayload) {
@@ -3351,10 +3375,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
               );
               
                 if (trickData['success'] == true) {
-                print('✅ Nouveau trick prêt, le bot peut jouer');
-                scheduleMaybeAutoPlayCurrentBot();
-                if (!_isRoomCreator && _isBotPlayerName(cardManager.currentPlayerTurn)) {
-                  _scheduleBotPlayFallback();
+                print('✅ Nouveau trick prêt');
+                if (!serverDrivesBots) {
+                  scheduleMaybeAutoPlayCurrentBot();
                 }
               } else {
                 // ✅ Erreur 409 - le trick n'est pas encore prêt, attendre plus longtemps
@@ -3485,12 +3508,17 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       _currentGameId = int.tryParse(gameId.toString());
     }
 
-    final chat = data['chat'] as Map<String, dynamic>?;
-    if (chat != null) {
-      _ingestChatFromSync(chat);
+    final chatRaw = data['chat'];
+    if (chatRaw is Map) {
+      _ingestChatFromSync(Map<String, dynamic>.from(chatRaw));
     }
 
-    final round = data['round'] as Map<String, dynamic>?;
+    Map<String, dynamic>? round;
+    final roundRaw = data['round'];
+    if (roundRaw is Map) {
+      round = Map<String, dynamic>.from(roundRaw);
+    }
+
     if (round != null) {
       _applyDistributionFromSyncRound(round);
 
@@ -3530,7 +3558,11 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     if (round == null) return;
 
     final status = round['status'] as String?;
-    final announcements = round['announcements'] as Map<String, dynamic>?;
+    final announcementsRaw = round['announcements'];
+    Map<String, dynamic>? announcements;
+    if (announcementsRaw is Map) {
+      announcements = Map<String, dynamic>.from(announcementsRaw);
+    }
     if (status == 'ANNOUNCEMENT_PHASE' &&
         announcements != null &&
         _localPlayerHasCards()) {
