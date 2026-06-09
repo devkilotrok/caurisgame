@@ -207,17 +207,18 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   }
 
   @override
-  Future<void> handleAnnouncementTurnComplete() async {
+  Future<void> handleAnnouncementTurnComplete({bool fromBackend = false}) async {
     if (cardManager.getPlayerCards(widget.currentPlayerName).isEmpty) {
       print('⚠️ Pas de cartes — /sync avant passage en phase de jeu');
       await _pullDistributionFromSync();
       if (cardManager.getPlayerCards(widget.currentPlayerName).isEmpty) {
         print('❌ Phase de jeu bloquée: cartes toujours absentes après /sync');
+        isProcessingAnnouncementCompletion = false;
         _scheduleDistributionSyncFallback();
         return;
       }
     }
-    await super.handleAnnouncementTurnComplete();
+    await super.handleAnnouncementTurnComplete(fromBackend: fromBackend);
   }
 
   bool _needsDistributionApply(int? roundNumber) {
@@ -295,6 +296,37 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     return a.toString() == b.toString();
   }
 
+  Timer? _announcementCompletionPollTimer;
+
+  int? _parseRoundNumber(dynamic raw) {
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw);
+    return null;
+  }
+
+  void _scheduleAnnouncementCompletionPoll() {
+    if (!cardManager.isAnnouncementPhase) return;
+    _announcementCompletionPollTimer?.cancel();
+    _announcementCompletionPollTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) {
+        if (!mounted || !cardManager.isAnnouncementPhase) {
+          _announcementCompletionPollTimer?.cancel();
+          return;
+        }
+        unawaited(_tryCompleteAnnouncementPhaseFromBackend(
+          reason: 'waiting_panel_poll',
+        ));
+      },
+    );
+  }
+
+  void _cancelAnnouncementCompletionPoll() {
+    _announcementCompletionPollTimer?.cancel();
+    _announcementCompletionPollTimer = null;
+  }
+
   bool _announcementCompletionCheckInFlight = false;
 
   bool _matchesRoundNumber(int? roundNumber) {
@@ -357,8 +389,12 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       _backendPlayFirstPlayer = firstPlayer;
     }
 
-    await handleAnnouncementTurnComplete();
+    await handleAnnouncementTurnComplete(fromBackend: true);
     _restartRoomSyncPolling(forceRestart: true);
+
+    if (!cardManager.isAnnouncementPhase) {
+      _cancelAnnouncementCompletionPoll();
+    }
 
     if (_backendPlayFirstPlayer != null &&
         _backendPlayFirstPlayer!.isNotEmpty &&
@@ -412,6 +448,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
       await _completeAnnouncementPhaseFromBackend(
         announcements: announcementsMap,
+        firstPlayer: turnData['first_player'] as String?,
         roundNumber: _effectiveRoundNumber(),
         source: 'getAnnouncementTurn/$reason',
       );
@@ -960,6 +997,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     _roundCompletedSubscription?.cancel();
     _cardDistributionSubscription?.cancel();
     _turnChangedSubscription?.cancel(); // ✅ NOUVEAU: Annuler l'écoute des changements de tour
+    _cancelAnnouncementCompletionPoll();
 
     _chatInputController.dispose();
     _chatScrollController.dispose();
@@ -2075,32 +2113,18 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       if (!mounted) return;
       
       final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
-      final roundNumber = data['round_number'] as int?;
+      final roundNumber = _parseRoundNumber(data['round_number']);
       final announcements = data['announcements'] as Map<String, dynamic>?;
       
-      if (roomId == gameSession.roomId && roundNumber == gameSession.currentRound) {
-        print('✅ Toutes les annonces sont terminées (événement backend)');
-        
-        // Synchroniser les annonces depuis le backend
-        if (announcements != null) {
-          for (final entry in announcements.entries) {
-            final playerName = entry.key as String;
-            final announcement = (entry.value as num?)?.toInt() ?? 0;
-            
-            // Vérifier si l'annonce n'existe pas déjà
-            final existingAnnouncements = cardManager.getCurrentRoundAnnouncements();
-            final alreadyExists = existingAnnouncements.any(
-              (ann) => ann['player'] == playerName,
-            );
-            
-            if (!alreadyExists) {
-              cardManager.makeAnnouncement(playerName, announcement);
-            }
-          }
-        }
-        
-        // Passer à la phase de jeu
-        super.handleAnnouncementTurnComplete();
+      if (roomId?.toString() == gameSession.roomId?.toString() &&
+          _matchesRoundNumber(roundNumber)) {
+        unawaited(_completeAnnouncementPhaseFromBackend(
+          announcements: announcements != null
+              ? Map<String, dynamic>.from(announcements)
+              : null,
+          roundNumber: roundNumber,
+          source: 'all_announcements_completed_ws',
+        ));
       }
     });
 
@@ -2119,7 +2143,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       if (!mounted) return;
       
       final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
-      final roundNumber = data['round_number'] as int?;
+      final roundNumber = _parseRoundNumber(data['round_number']);
       final playerName = data['playerName'] as String? ?? data['player_pseudo'] as String?;
       final announcement = data['announcement'] as int? ?? data['announcement_value'] as int?;
       final submittedCount = data['submitted_count'] as int?;
@@ -2165,7 +2189,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       print('📥 Événement announcements_complete reçu: $data');
       
       final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
-      final roundNumber = data['round_number'] as int?;
+      final roundNumber = _parseRoundNumber(data['round_number']);
       final announcements = data['announcements'] as Map<String, dynamic>?;
       final firstPlayer = data['first_player'] as String?;
       final announcementsAdjusted = data['announcements_adjusted'] == true;
@@ -2447,7 +2471,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       
       final roomId = data['roomId'] as String? ?? data['room_id'] as String?;
       final roundId = data['round_id'] as int?;
-      final roundNumber = data['round_number'] as int?;
+      final roundNumber = _parseRoundNumber(data['round_number']);
       
       // ✅ Gérer le cas où scores peut être une List ou une Map
       final scoresRaw = data['scores'];
@@ -5422,7 +5446,16 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   Widget _buildWaitingForOthersPanel() {
     final announcements = cardManager.getCurrentRoundAnnouncements();
     final submittedCount = announcements.length;
-    
+    final expectedCount = gameSession.players.length;
+
+    if (submittedCount >= expectedCount && cardManager.isAnnouncementPhase) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scheduleAnnouncementCompletionPoll();
+        unawaited(_tryCompleteAnnouncementPhaseFromBackend(
+          reason: 'waiting_panel_4of4',
+        ));
+      });
+    }
     return Positioned(
       bottom: 120,
       left: 20,
@@ -5449,7 +5482,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
               ),
               const SizedBox(height: 8),
               Text(
-                'En attente des autres joueurs...\n($submittedCount/4)',
+                'En attente des autres joueurs...\n($submittedCount/$expectedCount)',
                 textAlign: TextAlign.center,
                 style: const TextStyle(
                   fontSize: 14,

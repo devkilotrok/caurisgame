@@ -489,14 +489,17 @@ class LocalCardManager {
     
     // Vérifier que chaque joueur a bien une annonce
     final announcedPlayers = _currentRoundAnnouncements
-        .map((ann) => ann['player'] as String?)
-        .where((name) => name != null)
+        .map((ann) => (ann['player'] as String?)?.toLowerCase().trim())
+        .where((name) => name != null && name.isNotEmpty)
+        .cast<String>()
         .toSet();
-    
-    final allPlayersSet = playerNames.toSet();
-    
-    // Tous les joueurs doivent avoir annoncé
-    final allDone = allPlayersSet.every((playerName) => announcedPlayers.contains(playerName));
+
+    final allPlayersSet = playerNames
+        .map((n) => n.toLowerCase().trim())
+        .toSet();
+
+    // Tous les joueurs doivent avoir annoncé (comparaison insensible à la casse)
+    final allDone = allPlayersSet.every(announcedPlayers.contains);
     
     if (allDone) {
       print('✅ Toutes les annonces sont faites: ${_currentRoundAnnouncements.length} annonces pour ${playerNames.length} joueurs');
@@ -504,7 +507,9 @@ class LocalCardManager {
         print('   - ${ann['player']}: ${ann['announcement']} plis');
       }
     } else {
-      final missing = allPlayersSet.difference(announcedPlayers);
+      final missing = playerNames.where(
+        (name) => !announcedPlayers.contains(name.toLowerCase().trim()),
+      );
       print('⚠️ Annonces incomplètes: ${_currentRoundAnnouncements.length}/${playerNames.length}, manquants: $missing');
     }
     

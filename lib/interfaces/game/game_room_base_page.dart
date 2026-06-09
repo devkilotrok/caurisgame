@@ -2854,7 +2854,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
   }
 
   // Fonction pour gérer la fin du tour d'annonce
-  Future<void> handleAnnouncementTurnComplete() async {
+  Future<void> handleAnnouncementTurnComplete({bool fromBackend = false}) async {
     // ⚠️ Si la phase d'annonces est déjà terminée, ignorer les appels tardifs
     if (!cardManager.isAnnouncementPhase) {
       print('⚠️ handleAnnouncementTurnComplete ignoré: phase d\'annonces déjà terminée');
@@ -2863,8 +2863,12 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
 
     // ✅ Protection contre les appels multiples
     if (isProcessingAnnouncementCompletion) {
-      print('⚠️ handleAnnouncementTurnComplete déjà en cours - évitement du doublon');
-      return;
+      if (!fromBackend) {
+        print('⚠️ handleAnnouncementTurnComplete déjà en cours - évitement du doublon');
+        return;
+      }
+      print('⚠️ Reprise forcée de la fin d\'annonces (source backend)');
+      isProcessingAnnouncementCompletion = false;
     }
     
     final playerNames = gameSession.players
@@ -2874,15 +2878,12 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     // ✅ Vérifier si toutes les annonces sont faites AVANT de passer au tour suivant
     // ⚠️ IMPORTANT: Le round est déjà ajouté dans announcements_complete (game_room_human_page.dart)
     // On ne doit PAS l'ajouter ici pour éviter les doublons
-    if (cardManager.areAllAnnouncementsDone(playerNames)) {
-      // ✅ Protection contre les appels multiples pour l'ajout de round
-      if (isProcessingAnnouncementCompletion) {
-        print('⚠️ Round déjà en cours d\'ajout - évitement du doublon');
-        return;
-      }
+    final allDone =
+        fromBackend || cardManager.areAllAnnouncementsDone(playerNames);
+    if (allDone) {
       isProcessingAnnouncementCompletion = true;
       
-      print('✅ Toutes les annonces sont terminées !');
+      print('✅ Toutes les annonces sont terminées ! (fromBackend=$fromBackend)');
 
       // Réinitialiser le timer d'annonce
       announcementTimer?.cancel();
@@ -2954,7 +2955,10 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
 
       if (shouldShowAdjustmentMessage) {
         await delayForLowTotalAnnouncementMessage(true);
-        if (!mounted) return;
+        if (!mounted) {
+          isProcessingAnnouncementCompletion = false;
+          return;
+        }
         _startGamePhaseAfterAnnouncements();
         return;
       }
