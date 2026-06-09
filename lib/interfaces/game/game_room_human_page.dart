@@ -997,6 +997,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     _roundCompletedSubscription?.cancel();
     _cardDistributionSubscription?.cancel();
     _turnChangedSubscription?.cancel(); // ✅ NOUVEAU: Annuler l'écoute des changements de tour
+    _trickCompletionWatchdog?.cancel();
     _cancelAnnouncementCompletionPoll();
 
     _chatInputController.dispose();
@@ -2633,6 +2634,15 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       if (roomId != gameSession.roomId || currentPlayerName == null || currentPlayerName.isEmpty) {
         return;
       }
+
+      if (isCollectingTrick ||
+          cardManager.currentTrick.length >= cardManager.expectedPlayerCount) {
+        print(
+          'ℹ️ turn_changed ignoré: pli complet ou collecte en cours '
+          '(${cardManager.currentTrick.length}/${cardManager.expectedPlayerCount})',
+        );
+        return;
+      }
       
       // ✅ Synchroniser le tour depuis le backend
       if (cardManager.currentPlayerTurn != currentPlayerName) {
@@ -2709,6 +2719,16 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           final cardCode = '$normalizedValue$cardSuitShort';
           final trickNumber =
               (data['trickNumber'] as int?) ?? (data['trick_number'] as int?) ?? cardManager.currentTrickNumber;
+          final activeTrickNumber = _trickNumberForApi();
+          if (trickNumber != activeTrickNumber &&
+              trickNumber != cardManager.currentTrickNumber) {
+            print(
+              '⚠️ card_played ignoré: pli #$trickNumber vs actif '
+              '#$activeTrickNumber (local #${cardManager.currentTrickNumber})',
+            );
+            unawaited(_resyncCurrentTrickFromBackend());
+            return;
+          }
           final eventKey = buildCardEventKey(playerName, cardCode, trickNumber);
           
           // ✅ Vérifier d'abord si c'est un événement local qu'on a déjà traité
@@ -2868,8 +2888,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           
           // ✅ Vérifier si le pli est complet (4 cartes)
           final updatedTrick = cardManager.currentTrick;
-          if (updatedTrick.length >= 4) {
+          if (updatedTrick.length >= cardManager.expectedPlayerCount) {
             print('🕒 Pli complété (4 cartes) - attente de trick_completed du backend');
+            _onTrickMayBeComplete();
           } else {
             print('   Pli incomplet: ${updatedTrick.length}/4 cartes');
           }
@@ -3030,6 +3051,84 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
   int? _lastProcessedTrickCompletedNumber;
   int? _activeBackendTrickNumber;
+  Timer? _trickCompletionWatchdog;
+
+  void _onTrickMayBeComplete() {
+    if (cardManager.currentTrick.length < cardManager.expectedPlayerCount) {
+      return;
+    }
+    _scheduleTrickCompletionWatchdog();
+  }
+
+  void _scheduleTrickCompletionWatchdog() {
+    _trickCompletionWatchdog?.cancel();
+    _trickCompletionWatchdog = Timer(const Duration(seconds: 4), () {
+      if (!mounted) return;
+      unawaited(_recoverTrickCompletionFromBackend());
+    });
+  }
+
+  /// Fallback si trick_completed WebSocket n'arrive pas alors que 4 cartes sont au centre.
+  Future<void> _recoverTrickCompletionFromBackend() async {
+    if (!mounted || isCollectingTrick) return;
+
+    final expected = cardManager.expectedPlayerCount;
+    if (cardManager.currentTrick.length < expected) return;
+
+    final currentTrickNum = _trickNumberForApi();
+    if (_lastProcessedTrickCompletedNumber == currentTrickNum) return;
+
+    final roomId = gameSession.roomId;
+    if (roomId == null || roomId.isEmpty) return;
+
+    print('🩹 Watchdog: récupération fin de pli #$currentTrickNum via API');
+    _addDebugLog('🩹 Watchdog fin de pli #$currentTrickNum');
+
+    try {
+      final trickData = await GameApiService.instance.getCurrentTrick(
+        roomId: roomId,
+        roundNumber: _effectiveRoundNumber(),
+        trickNumber: currentTrickNum.clamp(1, 13),
+      );
+
+      if (trickData['success'] != true) return;
+
+      final rawData = trickData['data'];
+      if (rawData is! Map) return;
+      final data = Map<String, dynamic>.from(rawData);
+
+      final status = data['trick_status'] as String? ?? 'in_progress';
+      final winnerName = data['winner_name'] as String?;
+      final cardsInTrick = (data['cards_in_trick'] as num?)?.toInt() ?? 0;
+
+      if (status == 'completed' &&
+          winnerName != null &&
+          winnerName.isNotEmpty &&
+          cardsInTrick >= expected) {
+        await _onTrickCompletedFromWebSocket({
+          'roomId': roomId,
+          'winner_name': winnerName,
+          'current_trick_number': currentTrickNum,
+          'next_trick_number': data['next_trick_number'],
+          'obtained_tricks': data['obtained_tricks'],
+          'trick_cards': data['played_cards'],
+        });
+        return;
+      }
+
+      if (cardsInTrick >= expected && status != 'completed') {
+        print('⚠️ Watchdog: pli #$currentTrickNum toujours bloqué — nouvelle tentative');
+        _scheduleTrickCompletionWatchdog();
+      }
+    } catch (e) {
+      print('⚠️ Watchdog fin de pli: $e');
+    }
+  }
+
+  @override
+  void onTrickCompletedPlayCardResponse() {
+    _onTrickMayBeComplete();
+  }
 
   int _trickNumberForApi() {
     if (_activeBackendTrickNumber != null && _activeBackendTrickNumber! > 0) {
@@ -3136,6 +3235,29 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         }
       }
 
+      final trickStatus = data['trick_status'] as String? ?? 'in_progress';
+      final winnerName = data['winner_name'] as String?;
+      final backendCount = (data['cards_in_trick'] as num?)?.toInt() ?? 0;
+      final expected = cardManager.expectedPlayerCount;
+
+      if (trickStatus == 'completed' &&
+          winnerName != null &&
+          winnerName.isNotEmpty &&
+          backendCount >= expected &&
+          backendTrickNumber != null &&
+          _lastProcessedTrickCompletedNumber != backendTrickNumber) {
+        print('🩹 Resync: pli #$backendTrickNumber terminé côté backend — clôture locale');
+        await _onTrickCompletedFromWebSocket({
+          'roomId': roomId,
+          'winner_name': winnerName,
+          'current_trick_number': backendTrickNumber,
+          'next_trick_number': data['next_trick_number'],
+          'obtained_tricks': data['obtained_tricks'],
+          'trick_cards': data['played_cards'],
+        });
+        return;
+      }
+
       final currentTurn = data['current_turn'];
       if (currentTurn is Map) {
         final name = (currentTurn['player_name'] ?? currentTurn['playerName'])
@@ -3150,11 +3272,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
       final entries = _trickEntriesFromPayload(playedRaw);
       final localCount = cardManager.currentTrick.length;
-      final backendCount = entries.length;
-      final expected = cardManager.expectedPlayerCount;
+      final payloadCount = entries.length;
 
       // Pli terminé côté backend : ne pas réinjecter dans un centre vide
-      if (backendCount >= expected && localCount == 0) {
+      if (payloadCount >= expected && localCount == 0) {
         print(
           'ℹ️ Resync ignoré: pli #$backendTrickNumber terminé — '
           'passage au pli ${(backendTrickNumber ?? trickNumber) + 1}',
@@ -3167,7 +3288,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       }
 
       // Compléter uniquement si le backend a plus de cartes (pli en cours)
-      if (backendCount > localCount && backendCount < expected) {
+      if (payloadCount > localCount && payloadCount < expected) {
         _replaceTrickFromBackendPayload(playedRaw);
         gameLogic.syncCurrentTrick(cardManager.currentTrick);
       }
@@ -3329,6 +3450,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       currentTrickNumber,
       nextTrickNumber: nextTrickNumber,
     );
+
+    _trickCompletionWatchdog?.cancel();
   }
 
   /// Méthode dédiée pour gérer la fin d'un pli (animation + nettoyage)

@@ -417,6 +417,10 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
   @protected
   void onGameRoomInitialize() {}
 
+  /// Appelé quand playCard HTTP indique trick_completed (watchdog côté page enfant).
+  @protected
+  void onTrickCompletedPlayCardResponse() {}
+
   @protected
   void onGameRoomDispose() {}
 
@@ -1363,7 +1367,9 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       // Le backend retourne maintenant current_turn dans la réponse, évitant la race condition
       final trickCompleted = result['data']?['trick_completed'] == true;
       
-      if (!trickCompleted) {
+      if (trickCompleted) {
+        onTrickCompletedPlayCardResponse();
+      } else {
         // ✅ Utiliser le tour retourné par le backend (évite de recalculer après 200ms)
         final currentTurnData = result['data']?['current_turn'] as Map<String, dynamic>?;
         if (currentTurnData != null) {
