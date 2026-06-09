@@ -684,7 +684,21 @@ class LocalCardManager {
 
   // ✅ NOUVELLE MÉTHODE: Ajouter une carte au trick sans vérifier le tour
   // Utilisée après confirmation du backend quand le tour a déjà changé
-  void addCardToTrick(String playerName, Map<String, dynamic> card) {
+  /// Remplace le pli courant sans modifier les mains (resync backend).
+  void replaceCurrentTrickFromSync(List<Map<String, dynamic>> entries) {
+    _currentTrick = entries
+        .map((entry) => Map<String, dynamic>.from(entry))
+        .toList();
+    print(
+      '✅ Pli resynchronisé (${_currentTrick.length} cartes, mains inchangées)',
+    );
+  }
+
+  void addCardToTrick(
+    String playerName,
+    Map<String, dynamic> card, {
+    bool removeFromHand = true,
+  }) {
     if (_isAnnouncementPhase) {
       print('⚠️ Tentative d\'ajouter une carte pendant la phase d\'annonces. Action ignorée.');
       return;
@@ -713,14 +727,18 @@ class LocalCardManager {
       return;
     }
 
-    // ✅ Retirer la carte de la main du joueur si elle existe
-    final playerHand = _distributedCards[playerName];
-    if (playerHand != null) {
-      final codeToRemove = cardCode;
-      final index = playerHand.indexWhere((c) => (c['code'] as String?) == codeToRemove);
-      if (index != -1) {
-        playerHand.removeAt(index);
-        print('✅ Carte $cardCode retirée de la main de $playerName (${playerHand.length} cartes restantes)');
+    if (removeFromHand) {
+      final playerHand = _distributedCards[playerName];
+      if (playerHand != null) {
+        final index =
+            playerHand.indexWhere((c) => (c['code'] as String?) == cardCode);
+        if (index != -1) {
+          playerHand.removeAt(index);
+          print(
+            '✅ Carte $cardCode retirée de la main de $playerName '
+            '(${playerHand.length} cartes restantes)',
+          );
+        }
       }
     }
 

@@ -1300,56 +1300,47 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
         playerName: playerName,
       );
 
-      // 4. ✅ Pour les joueurs locaux, attendre que l'animation soit terminée avant d'ajouter la carte au trick
-      // Cela garantit que la carte n'apparaît pas au centre avant la fin de l'animation
+      // 4. Appliquer la carte au pli dès confirmation backend (avant fin animation)
+      final currentTrick = cardManager.currentTrick;
+      final cardAlreadyInTrick = currentTrick.any((entry) {
+        final entryCard = entry['card'] as Map<String, dynamic>?;
+        final entryPlayer = entry['player'] as String?;
+        return entryPlayer == effectivePlayerName &&
+            (entryCard?['code'] as String?) == cardCode;
+      });
+
+      final playerHand = cardManager.getPlayerCards(effectivePlayerName);
+      final cardIndex =
+          playerHand.indexWhere((c) => (c['code'] as String?) == cardCode);
+      if (cardIndex != -1) {
+        playerHand.removeAt(cardIndex);
+        print(
+          '✅ Carte $cardCode retirée de la main de $effectivePlayerName '
+          '(${playerHand.length} cartes restantes)',
+        );
+      }
+
+      if (!cardAlreadyInTrick) {
+        cardManager.addCardToTrick(
+          effectivePlayerName,
+          card,
+          removeFromHand: false,
+        );
+        print(
+          '✅ Carte $cardCode ajoutée au trick pour $effectivePlayerName '
+          '(confirmation backend)',
+        );
+      }
+
+      if (mounted) setState(() {});
+
+      // 5. Attendre la fin de l'animation (cosmétique uniquement)
       if (isLocalPlayer && animationCompleter != null) {
         try {
           await animationCompleter.future.timeout(const Duration(seconds: 4));
         } on TimeoutException {
           print('⚠️ Animation timeout (4s) — poursuite du jeu');
         }
-      }
-
-      // 5. ✅ Pour TOUS les joueurs (locaux et bots), ajouter la carte au trick APRÈS confirmation du backend
-      // Pour les bots, la carte a déjà été ajoutée avant l'animation, donc on vérifie d'abord
-      final currentTrick = cardManager.currentTrick;
-      final cardAlreadyInTrick = currentTrick.any((entry) {
-        final entryCard = entry['card'] as Map<String, dynamic>?;
-        final entryPlayer = entry['player'] as String?;
-        return entryPlayer == effectivePlayerName && (entryCard?['code'] as String?) == cardCode;
-      });
-      
-      // ✅ IMPORTANT: Retirer la carte de la main IMMÉDIATEMENT après confirmation du backend
-      // Cela garantit la synchronisation entre backend et frontend
-      final playerHand = cardManager.getPlayerCards(effectivePlayerName);
-      final cardIndex = playerHand.indexWhere((c) => (c['code'] as String?) == cardCode);
-      if (cardIndex != -1) {
-        playerHand.removeAt(cardIndex);
-        print('✅ Carte $cardCode retirée de la main de $effectivePlayerName (${playerHand.length} cartes restantes)');
-      } else {
-        print('⚠️ Carte $cardCode non trouvée dans la main de $effectivePlayerName (déjà retirée?)');
-      }
-      
-      // ✅ Ajouter la carte au trick si elle n'y est pas déjà
-      if (!cardAlreadyInTrick) {
-        // La carte n'est pas encore dans le trick, l'ajouter
-        // ✅ CORRECTION: Utiliser addCardToTrick() au lieu de playCard()
-        // car le tour a peut-être déjà changé via WebSocket
-        cardManager.addCardToTrick(effectivePlayerName, card);
-        if (isLocalPlayer) {
-          print('✅ Carte $cardCode ajoutée au trick pour $effectivePlayerName (joueur local) - après animation');
-        } else {
-          print('✅ Carte $cardCode ajoutée au trick pour $effectivePlayerName après confirmation backend');
-        }
-      } else {
-        print('ℹ️ Carte $cardCode déjà dans le trick pour $effectivePlayerName');
-      }
-      
-      // ✅ Mettre à jour le cache des cartes jouables après qu'une carte soit jouée
-      // (pour les joueurs locaux uniquement, via la classe enfant)
-      if (isLocalPlayer && mounted) {
-        // La classe enfant (GameRoomHumanPage) mettra à jour le cache si nécessaire
-        setState(() {});
       }
       
       // 5. Libérer le flag

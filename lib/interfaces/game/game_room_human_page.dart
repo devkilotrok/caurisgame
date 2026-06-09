@@ -365,6 +365,13 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         mounted &&
         !cardManager.isAnnouncementPhase) {
       cardManager.currentPlayerTurn = _backendPlayFirstPlayer!;
+      if (_backendPlayFirstPlayer == widget.currentPlayerName) {
+        setState(() {
+          _playableCardCodes.clear();
+          _playableCardsReady = false;
+        });
+        unawaited(_updatePlayableCardsFromBackend(force: true));
+      }
       setState(() {});
       startPlayerTurnTimeout();
       Future.delayed(const Duration(milliseconds: 500), () {
@@ -531,6 +538,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   
   // ✅ Cache des cartes jouables depuis le backend (pour éviter les erreurs 422)
   Set<String> _playableCardCodes = {};
+  bool _playableCardsReady = false;
   bool _isUpdatingPlayableCards = false;
 
   // Animations & controllers
@@ -1747,17 +1755,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       }
     };
 
-    // ✅ Le backend garantit désormais qu'au moins un pique est présent pour chaque joueur.
-    // Nous pouvons donc démarrer directement la phase d'annonces côté client.
-    cardManager.isAnnouncementPhase = true;
-    
-    // ✅ Déterminer le premier joueur à annoncer (même logique pour tous)
-    // Le premier joueur de la liste commence toujours
-    final firstPlayer = playerNames.isNotEmpty ? playerNames.first : widget.currentPlayerName;
-    cardManager.currentPlayerTurn = firstPlayer;
-    
-    print('✅ Jeu configuré, phase d\'annonces démarrée');
-    print('   Premier joueur à annoncer: $firstPlayer');
+    // La phase d'annonces est pilotée par announcement_phase_started (WebSocket / HTTP).
+    cardManager.isAnnouncementPhase = false;
+
+    print('✅ Jeu configuré après distribution — attente phase d\'annonces backend');
     print('   Joueur actuel: ${widget.currentPlayerName}');
     print('   Trick vidé: ${cardManager.currentTrick.isEmpty}');
     
@@ -2607,13 +2608,22 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         
         if (mounted) {
           if (currentPlayerName == widget.currentPlayerName) {
+            setState(() {
+              _playableCardCodes.clear();
+              _playableCardsReady = false;
+            });
             if (serverDrivesBots) {
               unawaited(_resyncCurrentTrickFromBackend().then((_) {
-                if (mounted) _updatePlayableCardsFromBackend();
+                if (mounted) _updatePlayableCardsFromBackend(force: true);
               }));
             } else {
-              _updatePlayableCardsFromBackend();
+              _updatePlayableCardsFromBackend(force: true);
             }
+          } else {
+            setState(() {
+              _playableCardCodes.clear();
+              _playableCardsReady = false;
+            });
           }
           setState(() {});
 
@@ -2745,20 +2755,22 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             print('   On continue quand même - ajouter la carte et synchroniser le tour');
           }
           
-          // ✅ VALIDER QUE LE JOUEUR A LA CARTE (pour les humains uniquement)
-          // Pour les bots, on fait confiance au backend
+          // Construire la carte depuis le backend (main locale parfois désynchronisée)
           Map<String, dynamic>? validCard;
           if (!isBotPlayer) {
             final playerCards = cardManager.getPlayerCards(playerName);
             print('   Cartes de $playerName: ${playerCards.map((c) => c['code']).join(", ")}');
-            
+
             try {
               validCard = playerCards.firstWhere(
-                (c) => (c['code'] as String?) == cardCode,
+                (c) => (c['code'] as String?)?.toUpperCase() == cardCode,
               );
             } catch (_) {
-              print('❌ ERREUR: Carte $cardCode introuvable pour $playerName - événement IGNORÉ');
-              return;
+              print(
+                '⚠️ Carte $cardCode absente de la main locale de $playerName '
+                '— utilisation du code backend',
+              );
+              validCard = _cardMapFromCode(cardCode);
             }
           } else {
             // Pour les bots, construire la carte depuis les données WebSocket
@@ -2957,6 +2969,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
         setState(() {
           _playableCardCodes = playableCardCodes;
+          _playableCardsReady = true;
           _isUpdatingPlayableCards = false;
         });
       } else {
@@ -2965,6 +2978,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         print(errorMsg);
         setState(() {
           _playableCardCodes.clear();
+          _playableCardsReady = false;
           _isUpdatingPlayableCards = false;
         });
       }
@@ -2975,6 +2989,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       if (mounted) {
         setState(() {
           _playableCardCodes.clear();
+          _playableCardsReady = false;
           _isUpdatingPlayableCards = false;
         });
       }
@@ -3056,10 +3071,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
       final playedRaw = data['played_cards'];
       if (playedRaw is List) {
-        if (playedRaw.length != cardManager.currentTrick.length) {
-          cardManager.clearCurrentTrick();
-        }
-        await _syncTrickCardsFromPayload(playedRaw);
+        _replaceTrickFromBackendPayload(playedRaw);
         gameLogic.syncCurrentTrick(cardManager.currentTrick);
       }
     } catch (e) {
@@ -3067,12 +3079,42 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     }
   }
 
+  List<Map<String, dynamic>> _trickEntriesFromPayload(List<dynamic> payload) {
+    final entries = <Map<String, dynamic>>[];
+    for (final raw in payload) {
+      if (raw is! Map) continue;
+      final playerName = (raw['player_name'] ?? raw['playerName']) as String?;
+      final cardCode =
+          ((raw['card_code'] ?? raw['cardCode']) as String?)?.toUpperCase();
+      if (playerName == null || cardCode == null || cardCode.isEmpty) continue;
+      entries.add({
+        'player': playerName,
+        'card': _cardMapFromCode(cardCode),
+        'timestamp': DateTime.now(),
+      });
+    }
+    return entries;
+  }
+
+  void _replaceTrickFromBackendPayload(List<dynamic> payload) {
+    final entries = _trickEntriesFromPayload(payload);
+    if (entries.isEmpty) return;
+    cardManager.replaceCurrentTrickFromSync(entries);
+    print('🔄 Pli remplacé depuis backend (${entries.length} cartes)');
+  }
+
   /// Synchronise le pli local avec les cartes envoyées par le backend.
   Future<void> _syncTrickCardsFromPayload(List<dynamic> trickCardsPayload) async {
+    if (trickCardsPayload.length >= cardManager.expectedPlayerCount) {
+      _replaceTrickFromBackendPayload(trickCardsPayload);
+      return;
+    }
+
     for (final raw in trickCardsPayload) {
       if (raw is! Map) continue;
       final playerName = (raw['player_name'] ?? raw['playerName']) as String?;
-      final cardCode = ((raw['card_code'] ?? raw['cardCode']) as String?)?.toUpperCase();
+      final cardCode =
+          ((raw['card_code'] ?? raw['cardCode']) as String?)?.toUpperCase();
       if (playerName == null || cardCode == null || cardCode.isEmpty) continue;
 
       final alreadyPresent = cardManager.currentTrick.any((entry) {
@@ -4427,20 +4469,11 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     final cardCode = card['code'] as String? ?? '';
     bool isPlayable = false;
     
-    if (isCurrentPlayerTurn && !isAnnouncementPhase && !isPlayerPlaying) {
-      if (_playableCardCodes.isNotEmpty) {
-        // Utiliser le cache du backend
-        isPlayable = _playableCardCodes.contains(cardCode);
-      } else {
-        // Fallback: utiliser la logique locale
-        gameLogic.syncCurrentTrick(cardManager.currentTrick);
-        final localPlayable = gameLogic.getPlayableCards(
-          playerCards,
-          widget.currentPlayerName,
-          gameLogic.currentTrick.isEmpty,
-        );
-        isPlayable = localPlayable.contains(card);
-      }
+    if (isCurrentPlayerTurn &&
+        !isAnnouncementPhase &&
+        !isPlayerPlaying &&
+        _playableCardsReady) {
+      isPlayable = _playableCardCodes.contains(cardCode.toUpperCase());
     }
     
     // ✅ Mettre à jour le cache des cartes jouables si nécessaire
@@ -4465,8 +4498,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     final self = this;
     return GestureDetector(
       onTap: isPlayable ? () async {
-        // ✅ Vérifier une dernière fois que la carte est jouable avant de jouer
-        if (_playableCardCodes.isNotEmpty && !_playableCardCodes.contains(cardCode)) {
+        if (!_playableCardsReady ||
+            !_playableCardCodes.contains(cardCode.toUpperCase())) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text('Cette carte ($cardCode) n\'est plus jouable.'),
