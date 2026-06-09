@@ -987,6 +987,19 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       return;
     }
 
+    if (isCollectingTrick) {
+      print('⚠️ Jeu bloqué: animation de collecte du pli en cours');
+      return;
+    }
+
+    final alreadyInTrick = cardManager.currentTrick.any(
+      (e) => (e['player'] as String?) == widget.currentPlayerName,
+    );
+    if (alreadyInTrick) {
+      print('⚠️ ${widget.currentPlayerName} a déjà joué dans ce pli');
+      return;
+    }
+
     // ✅ Verrou immédiat (avant tout await) pour éviter le double-clic / double carte
     if (currentPlayerPlaying != null) {
       print('⚠️ ${currentPlayerPlaying} est déjà en train de jouer - évitement du doublon');
@@ -2059,6 +2072,10 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       return;
     }
 
+    if (isCollectingTrick) {
+      return;
+    }
+
     // Ne démarrer le timer que pour le joueur local (humain sur cet appareil)
     if (currentPlayer != widget.currentPlayerName) {
       return;
@@ -2106,6 +2123,18 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
   // ✅ NOUVEAU: Jouer automatiquement la plus grande carte jouable
   Future<void> _playHighestPlayableCard(String playerName) async {
     if (!mounted || cardManager.isAnnouncementPhase) {
+      return;
+    }
+
+    if (isCollectingTrick) {
+      return;
+    }
+
+    final alreadyInTrick = cardManager.currentTrick.any(
+      (e) => (e['player'] as String?) == playerName,
+    );
+    if (alreadyInTrick) {
+      print('⚠️ _playHighestPlayableCard: $playerName a déjà joué ce pli');
       return;
     }
 

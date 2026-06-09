@@ -1613,6 +1613,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     cardManager.resetRoundCounters();
     cardManager.clearCurrentTrick();
+    _lastProcessedTrickCompletedNumber = null;
+    _activeBackendTrickNumber = 1;
 
     for (final entry in normalized.entries) {
       final playerName = entry.key.toString();
@@ -1813,7 +1815,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
   @override
   Future<void> beforePlayCardValidation() async {
-    if (serverDrivesBots) {
+    if (!serverDrivesBots || isCollectingTrick) return;
+
+    final alreadyPlayed = cardManager.currentTrick.any(
+      (e) => (e['player'] as String?) == widget.currentPlayerName,
+    );
+    if (alreadyPlayed) return;
+
+    if (cardManager.currentTrick.length < cardManager.expectedPlayerCount) {
       await _resyncCurrentTrickFromBackend();
     }
   }
@@ -2636,13 +2645,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
               _playableCardCodes.clear();
               _playableCardsReady = false;
             });
-            if (serverDrivesBots) {
-              unawaited(_resyncCurrentTrickFromBackend().then((_) {
-                if (mounted) _updatePlayableCardsFromBackend(force: true);
-              }));
-            } else {
-              _updatePlayableCardsFromBackend(force: true);
-            }
+            _updatePlayableCardsFromBackend(force: true);
           } else {
             setState(() {
               _playableCardCodes.clear();
@@ -3026,6 +3029,50 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   }
 
   int? _lastProcessedTrickCompletedNumber;
+  int? _activeBackendTrickNumber;
+
+  int _trickNumberForApi() {
+    if (_activeBackendTrickNumber != null && _activeBackendTrickNumber! > 0) {
+      return _activeBackendTrickNumber!;
+    }
+    return cardManager.currentTrickNumber > 0 ? cardManager.currentTrickNumber : 1;
+  }
+
+  @override
+  Future<int?> getTrickIdForCurrentTrick() async {
+    try {
+      final roomId = gameSession.roomId;
+      if (roomId == null || roomId.isEmpty) return null;
+
+      final roundNumber = _effectiveRoundNumber();
+      final trickNumber = _trickNumberForApi().clamp(1, 13);
+
+      final trickData = await GameApiService.instance.getCurrentTrick(
+        roomId: roomId,
+        roundNumber: roundNumber,
+        trickNumber: trickNumber,
+      );
+
+      if (trickData['success'] == true) {
+        final rawData = trickData['data'];
+        if (rawData is Map) {
+          final data = Map<String, dynamic>.from(rawData);
+          final backendTrickNumber = (data['trick_number'] as num?)?.toInt();
+          if (backendTrickNumber != null) {
+            _activeBackendTrickNumber = backendTrickNumber;
+            if (backendTrickNumber != cardManager.currentTrickNumber) {
+              cardManager.setCurrentTrickNumber(backendTrickNumber);
+            }
+          }
+          return data['trick_id'] as int?;
+        }
+      }
+      return null;
+    } catch (e) {
+      print('⚠️ Erreur lors de la récupération du trick_id: $e');
+      return null;
+    }
+  }
 
   /// Construit une carte jouable à partir d'un code (ex: 7H, AS).
   Map<String, dynamic> _cardMapFromCode(String cardCode) {
@@ -3057,14 +3104,17 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
   /// Resynchronise le pli et le tour depuis GET get-current-trick (source de vérité).
   Future<void> _resyncCurrentTrickFromBackend() async {
+    if (isCollectingTrick) {
+      print('ℹ️ Resync pli ignoré: animation de collecte en cours');
+      return;
+    }
+
     final roomId = gameSession.roomId;
     if (roomId == null || roomId.isEmpty) return;
 
     try {
       final roundNumber = _effectiveRoundNumber();
-      final trickNumber = cardManager.currentTrickNumber > 0
-          ? cardManager.currentTrickNumber
-          : 1;
+      final trickNumber = _trickNumberForApi().clamp(1, 13);
 
       final trickData = await GameApiService.instance.getCurrentTrick(
         roomId: roomId,
@@ -3079,9 +3129,11 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       final data = Map<String, dynamic>.from(rawData);
 
       final backendTrickNumber = (data['trick_number'] as num?)?.toInt();
-      if (backendTrickNumber != null &&
-          backendTrickNumber != cardManager.currentTrickNumber) {
-        cardManager.setCurrentTrickNumber(backendTrickNumber);
+      if (backendTrickNumber != null) {
+        _activeBackendTrickNumber = backendTrickNumber;
+        if (backendTrickNumber != cardManager.currentTrickNumber) {
+          cardManager.setCurrentTrickNumber(backendTrickNumber);
+        }
       }
 
       final currentTurn = data['current_turn'];
@@ -3094,7 +3146,28 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       }
 
       final playedRaw = data['played_cards'];
-      if (playedRaw is List) {
+      if (playedRaw is! List) return;
+
+      final entries = _trickEntriesFromPayload(playedRaw);
+      final localCount = cardManager.currentTrick.length;
+      final backendCount = entries.length;
+      final expected = cardManager.expectedPlayerCount;
+
+      // Pli terminé côté backend : ne pas réinjecter dans un centre vide
+      if (backendCount >= expected && localCount == 0) {
+        print(
+          'ℹ️ Resync ignoré: pli #$backendTrickNumber terminé — '
+          'passage au pli ${(backendTrickNumber ?? trickNumber) + 1}',
+        );
+        if (backendTrickNumber != null) {
+          _activeBackendTrickNumber = backendTrickNumber + 1;
+          cardManager.setCurrentTrickNumber(backendTrickNumber + 1);
+        }
+        return;
+      }
+
+      // Compléter uniquement si le backend a plus de cartes (pli en cours)
+      if (backendCount > localCount && backendCount < expected) {
         _replaceTrickFromBackendPayload(playedRaw);
         gameLogic.syncCurrentTrick(cardManager.currentTrick);
       }
@@ -3220,6 +3293,12 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     if (currentTrickNumber != null) {
       _lastProcessedTrickCompletedNumber = currentTrickNumber;
+    }
+
+    if (nextTrickNumber != null) {
+      _activeBackendTrickNumber = nextTrickNumber;
+    } else if (currentTrickNumber != null && currentTrickNumber < 13) {
+      _activeBackendTrickNumber = currentTrickNumber + 1;
     }
 
     final isRoundComplete = (nextTrickNumber != null && nextTrickNumber > 13) ||
@@ -3383,8 +3462,10 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       // Appliquer le numéro du prochain pli APRÈS l'animation (évite désync visuelle)
       if (nextTrickNumber != null) {
         cardManager.setCurrentTrickNumber(nextTrickNumber);
+        _activeBackendTrickNumber = nextTrickNumber;
       } else if (trickNumber != null && trickNumber < 13) {
         cardManager.setCurrentTrickNumber(trickNumber + 1);
+        _activeBackendTrickNumber = trickNumber + 1;
       }
 
       cardManager.currentPlayerTurn = winnerName;
