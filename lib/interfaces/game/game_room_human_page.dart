@@ -6287,11 +6287,28 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             // L'annonce est déjà enregistrée localement, le backend la synchronisera via WebSocket
           }
         } else {
-          // ✅ Pour les autres joueurs, envoyer via WebSocket
-          sendAnnouncementTimeoutViaWebSocket(playerName);
+          // ✅ Envoyer au backend au nom du joueur qui a timeout
+          // Cela permet de forcer la sauvegarde de son annonce en BDD si son appareil a crash/déconnecté
+          try {
+            var gameId = _currentGameId;
+            if (gameId == null) {
+              gameId = await getGameId();
+            }
+            final roundNumber = gameSession.currentRound;
+            
+            if (gameId != null && roundNumber >= 1) {
+              await GameApiService.instance.makeAnnouncement(
+                gameId: gameId,
+                roundNumber: roundNumber,
+                announcementValue: 2,
+                playerName: playerName, // Le backend accepte qu'on fournisse un nom
+              );
+              print('✅ Annonce timeout (2 plis) envoyée au backend pour $playerName par ${widget.currentPlayerName}');
+            }
+          } catch (e) {
+            print('⚠️ Erreur lors de l\'envoi de l\'annonce timeout au backend pour $playerName: $e');
+          }
         }
-      }
-    }
 
     await _tryCompleteAnnouncementPhaseFromBackend(reason: 'phase_timeout');
   }

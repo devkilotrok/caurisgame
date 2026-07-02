@@ -90,6 +90,7 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
         }
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = 'Erreur lors de la vérification: ${e.toString()}';
         _isLoading = false;
