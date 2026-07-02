@@ -1177,86 +1177,6 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       
       print('📤 Récupération round_id et trick_id: round=$roundNumber, trick=$trickNumber');
       
-      // ✅ AMÉLIORATION: Gérer l'erreur 409 "Trick not ready yet" avec retry amélioré
-      // ⚠️ IMPORTANT: Après trick_completed, le nouveau trick est créé par ProcessTrickEndJob
-      //    Il peut y avoir un délai de 1-2 secondes, donc on augmente les tentatives et le délai
-      Map<String, dynamic>? trickData;
-      int retries = 0;
-      const maxRetries = 5; // ✅ Augmenté de 3 à 5 tentatives
-      const initialRetryDelay = Duration(milliseconds: 500);
-      const maxRetryDelay = Duration(milliseconds: 1500); // ✅ Délai maximum de 1.5s
-      
-      while (retries < maxRetries) {
-        try {
-          trickData = await GameApiService.instance.getCurrentTrick(
-            roomId: roomId,
-            roundNumber: roundNumber,
-            trickNumber: trickNumber,
-          );
-          
-          if (trickData['success'] == true) {
-            if (retries > 0) {
-              print('✅ Trick récupéré après $retries tentative(s)');
-            }
-            break; // Succès, sortir de la boucle
-          }
-          
-          // ✅ Si c'est une erreur 409 "Trick not ready yet", réessayer avec délai progressif
-          final message = trickData['message'] as String? ?? '';
-          if (message.contains('Trick not ready') || message.contains('not ready yet')) {
-            retries++;
-            if (retries < maxRetries) {
-              // ✅ Délai progressif : 500ms, 750ms, 1000ms, 1250ms, 1500ms
-              final delayMs = (initialRetryDelay.inMilliseconds + (retries * 250)).clamp(
-                initialRetryDelay.inMilliseconds,
-                maxRetryDelay.inMilliseconds,
-              );
-              print('⏳ Trick pas encore prêt (409), réessai $retries/$maxRetries dans ${delayMs}ms...');
-              await Future.delayed(Duration(milliseconds: delayMs));
-              continue;
-            }
-          }
-          
-          // Autre erreur, arrêter
-          print('❌ Erreur lors de la récupération du trick: ${trickData['message']}');
-          currentPlayerPlaying = null;
-          return;
-        } catch (e) {
-          // ✅ Si c'est une exception avec "409" ou "Trick not ready", réessayer avec délai progressif
-          final errorStr = e.toString();
-          if (errorStr.contains('409') || errorStr.contains('Trick not ready')) {
-            retries++;
-            if (retries < maxRetries) {
-              // ✅ Délai progressif
-              final delayMs = (initialRetryDelay.inMilliseconds + (retries * 250)).clamp(
-                initialRetryDelay.inMilliseconds,
-                maxRetryDelay.inMilliseconds,
-              );
-              print('⏳ Trick pas encore prêt (exception 409), réessai $retries/$maxRetries dans ${delayMs}ms...');
-              await Future.delayed(Duration(milliseconds: delayMs));
-              continue;
-            }
-          }
-          
-          // Autre exception, arrêter
-          print('❌ Exception lors de la récupération du trick: $e');
-          currentPlayerPlaying = null;
-          return;
-        }
-      }
-      
-      // ✅ Vérifier que trickData a été initialisé et que la requête a réussi
-      if (trickData == null || trickData['success'] != true) {
-        print('❌ Impossible de récupérer le trick après $maxRetries tentatives');
-        currentPlayerPlaying = null;
-        return;
-      }
-
-      final data = trickData['data'] as Map<String, dynamic>;
-      final gameId = data['game_id'] as int;
-      final roundId = data['round_id'] as int;
-      final trickId = data['trick_id'] as int;
-
       // 2. Préparer le code de la carte
       cardCode = card['code'] as String? ?? '';
       if (cardCode.isEmpty) {
@@ -1281,11 +1201,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
         cardCode = '$cardValueShort$cardSuitShort';
       }
       
-      print('📤 Envoi carte via API Laravel: gameId=$gameId, roundId=$roundId, trickId=$trickId, card=$cardCode');
-      
       // ✅ ENREGISTRER L'ÉVÉNEMENT LOCAL AVANT L'APPEL API
-      // Cela permet à consumeLocalCardEvent de détecter que c'était un événement local
-      // et d'éviter la double animation quand l'événement WebSocket arrive
       effectivePlayerName = playerName ?? widget.currentPlayerName;
       final eventKey = buildCardEventKey(effectivePlayerName, cardCode, trickNumber);
       registerLocalCardEvent(eventKey);
@@ -1293,7 +1209,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       
       isLocalPlayer = effectivePlayerName == widget.currentPlayerName;
       
-      // ✅ OPTIMISTIC UI: Mettre à jour l'interface IMMÉDIATEMENT avant l'appel réseau
+      // ✅ OPTIMISTIC UI: Mettre à jour l'interface IMMÉDIATEMENT (0 ms de délai)
       final playerHand = cardManager.getPlayerCards(effectivePlayerName);
       final cardIndex = playerHand.indexWhere((c) => (c['code'] as String?) == cardCode);
       Map<String, dynamic>? removedCard;
@@ -1325,7 +1241,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       
       if (mounted) setState(() {});
       
-      // ✅ Démarrer l'animation immédiatement (maintenant que la carte est retirée de la main)
+      // ✅ Démarrer l'animation immédiatement (pendant que l'API est appelée en arrière-plan)
       Completer<void>? animationCompleter;
       if (isLocalPlayer) {
         animationCompleter = Completer<void>();
@@ -1333,6 +1249,79 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
           animationCompleter?.complete();
         });
       }
+
+      // ✅ AMÉLIORATION: Gérer l'erreur 409 "Trick not ready yet" avec retry amélioré
+      Map<String, dynamic>? trickData;
+      int retries = 0;
+      const maxRetries = 5; 
+      const initialRetryDelay = Duration(milliseconds: 500);
+      const maxRetryDelay = Duration(milliseconds: 1500); 
+      
+      while (retries < maxRetries) {
+        try {
+          trickData = await GameApiService.instance.getCurrentTrick(
+            roomId: roomId,
+            roundNumber: roundNumber,
+            trickNumber: trickNumber,
+          );
+          
+          if (trickData['success'] == true) {
+            if (retries > 0) {
+              print('✅ Trick récupéré après $retries tentative(s)');
+            }
+            break; // Succès, sortir de la boucle
+          }
+          
+          final message = trickData['message'] as String? ?? '';
+          if (message.contains('Trick not ready') || message.contains('not ready yet')) {
+            retries++;
+            if (retries < maxRetries) {
+              final delayMs = (initialRetryDelay.inMilliseconds + (retries * 250)).clamp(
+                initialRetryDelay.inMilliseconds,
+                maxRetryDelay.inMilliseconds,
+              );
+              print('⏳ Trick pas encore prêt (409), réessai $retries/$maxRetries dans ${delayMs}ms...');
+              await Future.delayed(Duration(milliseconds: delayMs));
+              continue;
+            }
+          }
+          
+          print('❌ Erreur lors de la récupération du trick: ${trickData['message']}');
+          currentPlayerPlaying = null;
+          return;
+        } catch (e) {
+          final errorStr = e.toString();
+          if (errorStr.contains('409') || errorStr.contains('Trick not ready')) {
+            retries++;
+            if (retries < maxRetries) {
+              final delayMs = (initialRetryDelay.inMilliseconds + (retries * 250)).clamp(
+                initialRetryDelay.inMilliseconds,
+                maxRetryDelay.inMilliseconds,
+              );
+              print('⏳ Trick pas encore prêt (exception 409), réessai $retries/$maxRetries dans ${delayMs}ms...');
+              await Future.delayed(Duration(milliseconds: delayMs));
+              continue;
+            }
+          }
+          
+          print('❌ Exception lors de la récupération du trick: $e');
+          currentPlayerPlaying = null;
+          return;
+        }
+      }
+      
+      if (trickData == null || trickData['success'] != true) {
+        print('❌ Impossible de récupérer le trick après $maxRetries tentatives');
+        currentPlayerPlaying = null;
+        return;
+      }
+
+      final data = trickData['data'] as Map<String, dynamic>;
+      final gameId = data['game_id'] as int;
+      final roundId = data['round_id'] as int;
+      final trickId = data['trick_id'] as int;
+      
+      print('📤 Envoi carte via API Laravel: gameId=$gameId, roundId=$roundId, trickId=$trickId, card=$cardCode');
       
       Map<String, dynamic>? result;
       
