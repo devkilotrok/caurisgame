@@ -1291,51 +1291,24 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       registerLocalCardEvent(eventKey);
       print('✅ Événement local enregistré: $eventKey (pour éviter la double animation)');
       
-      // ✅ ANIMATION IMMÉDIATE pour le joueur local AVANT l'appel API
-      // IMPORTANT: Retirer la carte de la main AVANT l'animation pour que l'animation fonctionne correctement
       isLocalPlayer = effectivePlayerName == widget.currentPlayerName;
       
-      // ✅ CORRECTION: Pour les joueurs locaux, créer un Completer pour attendre la fin de l'animation
-      Completer<void>? animationCompleter;
-      if (isLocalPlayer) {
-        animationCompleter = Completer<void>();
-        // ✅ Démarrer l'animation immédiatement
-        startCardAnimation(card, effectivePlayerName, () {
-          // Animation terminée - compléter le completer
-          animationCompleter?.complete();
-        });
-      }
+      // ✅ OPTIMISTIC UI: Mettre à jour l'interface IMMÉDIATEMENT avant l'appel réseau
+      final playerHand = cardManager.getPlayerCards(effectivePlayerName);
+      final cardIndex = playerHand.indexWhere((c) => (c['code'] as String?) == cardCode);
+      Map<String, dynamic>? removedCard;
       
-      // 3. Appeler l'API Laravel playCard
-      final result = await GameApiService.instance.playCard(
-        gameId: gameId,
-        roundId: roundId,
-        trickId: trickId,
-        cardCode: cardCode,
-        roundNumber: roundNumber,
-        trickNumber: trickNumber,
-        playerName: playerName,
-      );
+      if (cardIndex != -1) {
+        removedCard = playerHand.removeAt(cardIndex);
+        print('🚀 [OPTIMISTIC UI] Carte $cardCode retirée de la main de $effectivePlayerName');
+      }
 
-      // 4. Appliquer la carte au pli dès confirmation backend (avant fin animation)
       final currentTrick = cardManager.currentTrick;
       final cardAlreadyInTrick = currentTrick.any((entry) {
         final entryCard = entry['card'] as Map<String, dynamic>?;
         final entryPlayer = entry['player'] as String?;
-        return entryPlayer == effectivePlayerName &&
-            (entryCard?['code'] as String?) == cardCode;
+        return entryPlayer == effectivePlayerName && (entryCard?['code'] as String?) == cardCode;
       });
-
-      final playerHand = cardManager.getPlayerCards(effectivePlayerName);
-      final cardIndex =
-          playerHand.indexWhere((c) => (c['code'] as String?) == cardCode);
-      if (cardIndex != -1) {
-        playerHand.removeAt(cardIndex);
-        print(
-          '✅ Carte $cardCode retirée de la main de $effectivePlayerName '
-          '(${playerHand.length} cartes restantes)',
-        );
-      }
 
       if (!cardAlreadyInTrick) {
         cardManager.addCardToTrick(
@@ -1343,13 +1316,63 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
           card,
           removeFromHand: false,
         );
-        print(
-          '✅ Carte $cardCode ajoutée au trick pour $effectivePlayerName '
-          '(confirmation backend)',
-        );
+        print('🚀 [OPTIMISTIC UI] Carte $cardCode ajoutée au trick pour $effectivePlayerName');
       }
-
+      
+      // Bloquer le tour du joueur courant en attendant la réponse
+      final previousTurn = cardManager.currentPlayerTurn;
+      cardManager.currentPlayerTurn = ''; 
+      
       if (mounted) setState(() {});
+      
+      // ✅ Démarrer l'animation immédiatement (maintenant que la carte est retirée de la main)
+      Completer<void>? animationCompleter;
+      if (isLocalPlayer) {
+        animationCompleter = Completer<void>();
+        startCardAnimation(card, effectivePlayerName, () {
+          animationCompleter?.complete();
+        });
+      }
+      
+      Map<String, dynamic>? result;
+      
+      try {
+        // 3. Appeler l'API Laravel playCard (s'exécute en arrière-plan pendant l'animation)
+        result = await GameApiService.instance.playCard(
+          gameId: gameId,
+          roundId: roundId,
+          trickId: trickId,
+          cardCode: cardCode,
+          roundNumber: roundNumber,
+          trickNumber: trickNumber,
+          playerName: playerName,
+        );
+      } catch (e) {
+        // ❌ ROLLBACK EN CAS D'ERREUR RÉSEAU OU SERVEUR
+        print('❌ Erreur réseau ou backend, ANNULATION de l\'action (Rollback): $e');
+        
+        if (removedCard != null) {
+          // Remettre la carte dans la main (idéalement à son index d'origine si possible)
+          if (cardIndex != -1 && cardIndex <= playerHand.length) {
+            playerHand.insert(cardIndex, removedCard);
+          } else {
+            playerHand.add(removedCard);
+          }
+        }
+        
+        // Retirer la carte du pli central
+        cardManager.currentTrick.removeWhere((entry) => 
+          entry['player'] == effectivePlayerName && (entry['card']?['code'] as String?) == cardCode
+        );
+        
+        // Restaurer le tour
+        cardManager.currentPlayerTurn = previousTurn;
+        currentPlayerPlaying = null;
+        
+        if (mounted) setState(() {});
+        
+        return;
+      }
 
       // 5. Attendre la fin de l'animation (cosmétique uniquement)
       if (isLocalPlayer && animationCompleter != null) {
