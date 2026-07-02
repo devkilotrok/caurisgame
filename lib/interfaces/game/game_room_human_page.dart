@@ -6309,6 +6309,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
             print('⚠️ Erreur lors de l\'envoi de l\'annonce timeout au backend pour $playerName: $e');
           }
         }
+      }
+    }
 
     await _tryCompleteAnnouncementPhaseFromBackend(reason: 'phase_timeout');
   }
