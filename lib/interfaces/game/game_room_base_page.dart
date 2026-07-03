@@ -1014,100 +1014,26 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     // Obtenir les cartes du joueur actuel
     final playerCards = cardManager.getPlayerCards(widget.currentPlayerName);
 
-    // ✅ NOUVEAU: Valider les cartes jouables depuis le backend
-    try {
-      await beforePlayCardValidation();
-
-      // Obtenir gameId, roundId, trickId et playerId
-      final gameId = await getGameId();
-      final roundId = await getRoundIdForCurrentRound();
-      var trickId = await getTrickIdForCurrentTrick();
-      final playerId = await getPlayerId(widget.currentPlayerName);
-
-      if (gameId != null && roundId != null && trickId != null && playerId != null) {
-        // Appeler le backend pour obtenir les cartes jouables
-        var playableCardCodes = await GameApiService.instance.getPlayableCards(
-          gameId: gameId,
-          roundId: roundId,
-          trickId: trickId,
-          playerId: playerId,
-        );
-
-        // Vérifier si la carte est jouable
-        final cardCode = card['code'] as String;
-        if (!playableCardCodes.contains(cardCode) && serverDrivesBots) {
-          print('⚠️ Carte $cardCode refusée — resync pli puis nouvelle tentative');
-          await beforePlayCardValidation();
-          trickId = await getTrickIdForCurrentTrick();
-          if (trickId != null) {
-            playableCardCodes = await GameApiService.instance.getPlayableCards(
-              gameId: gameId,
-              roundId: roundId,
-              trickId: trickId,
-              playerId: playerId,
-            );
-          }
-        }
-
-        if (!playableCardCodes.contains(cardCode)) {
-          currentPlayerPlaying = null;
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Cette carte n\'est pas jouable selon les règles du jeu.'),
-              duration: const Duration(milliseconds: 1500),
-              behavior: SnackBarBehavior.floating,
-              margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            ),
-          );
-          return;
-        }
-      } else {
-        // Fallback: utiliser la logique locale si les IDs ne sont pas disponibles
-        print('⚠️ IDs non disponibles, utilisation de la logique locale pour les cartes jouables');
-        gameLogic.syncCurrentTrick(cardManager.currentTrick);
-        final playable = gameLogic.getPlayableCards(
-          playerCards,
-          widget.currentPlayerName,
-          gameLogic.currentTrick.isEmpty,
-        );
-        if (!playable.contains(card)) {
-          currentPlayerPlaying = null;
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Text('Cette carte n\'est pas jouable.'),
-              duration: const Duration(milliseconds: 800),
-              behavior: SnackBarBehavior.floating,
-              margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            ),
-          );
-          return;
-        }
-      }
-    } catch (e) {
-      // Fallback: utiliser la logique locale en cas d'erreur
-      print('⚠️ Erreur lors de la validation backend des cartes jouables: $e');
-      print('   Utilisation de la logique locale comme fallback');
-      gameLogic.syncCurrentTrick(cardManager.currentTrick);
-      final playable = gameLogic.getPlayableCards(
-        playerCards,
-        widget.currentPlayerName,
-        gameLogic.currentTrick.isEmpty,
+    // ✅ OPTIMISATION: Valider la carte LOCALEMENT pour ne pas bloquer l'UI
+    gameLogic.syncCurrentTrick(cardManager.currentTrick);
+    final playable = gameLogic.getPlayableCards(
+      playerCards,
+      widget.currentPlayerName,
+      gameLogic.currentTrick.isEmpty,
+    );
+    
+    if (!playable.any((c) => c['code'] == card['code'])) {
+      currentPlayerPlaying = null;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Cette carte n\'est pas jouable selon les règles.'),
+          duration: const Duration(milliseconds: 1000),
+          behavior: SnackBarBehavior.floating,
+          margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        ),
       );
-      if (!playable.contains(card)) {
-        currentPlayerPlaying = null;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text('Cette carte n\'est pas jouable.'),
-            duration: const Duration(milliseconds: 800),
-            behavior: SnackBarBehavior.floating,
-            margin: const EdgeInsets.only(bottom: 100, left: 20, right: 20),
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          ),
-        );
-        return;
-      }
+      return;
     }
 
     // ✅ Annuler le timer de timeout si le joueur joue manuellement

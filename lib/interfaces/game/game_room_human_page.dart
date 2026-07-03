@@ -2976,62 +2976,45 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
   /// Récupère la liste des codes de cartes jouables pour le joueur actuel depuis le backend.
   @override
   Future<void> _updatePlayableCardsFromBackend({bool force = false}) async {
-    if (_isUpdatingPlayableCards && !force) {
-      _addDebugLog('⚠️ Déjà en cours de mise à jour des cartes jouables (force=false). Ignoré.');
-      return;
-    }
-    _addDebugLog('🔄 Début de la mise à jour des cartes jouables (force=$force)...');
+    // 🚀 OPTIMISATION: Calculer les cartes jouables localement et instantanément
+    // au lieu de faire 4 appels réseau qui ralentissaient considérablement l'affichage.
     
-    setState(() {
-      _isUpdatingPlayableCards = true;
-    });
-
-    final currentRoomId = gameSession.roomId;
-    if (currentRoomId == null || currentRoomId.isEmpty) {
-      _addDebugLog('❌ Room ID est null/vide. Impossible de récupérer les cartes jouables.');
-      setState(() {
-        _isUpdatingPlayableCards = false;
-      });
+    final playerName = widget.currentPlayerName;
+    if (playerName.isEmpty || !isCurrentPlayerTurn) {
+      if (mounted) {
+        setState(() {
+          _playableCardCodes.clear();
+          _playableCardsReady = false;
+        });
+      }
       return;
     }
 
     try {
-      // Obtenir les IDs nécessaires pour l'API
-      final gameId = await getGameId();
-      final roundId = await getRoundIdForCurrentRound();
-      final trickId = await getTrickIdForCurrentTrick();
-      final playerId = await getPlayerId(widget.currentPlayerName);
+      gameLogic.syncCurrentTrick(cardManager.currentTrick);
+      final playerCards = cardManager.getPlayerCards(playerName);
       
-      if (gameId != null && roundId != null && trickId != null && playerId != null) {
-        final playableCardCodesList = await GameApiService.instance.getPlayableCards(
-          gameId: gameId,
-          roundId: roundId,
-          trickId: trickId,
-          playerId: playerId,
-        );
-        
-        final playableCardCodes = playableCardCodesList.toSet();
-        final message = '✅ Cartes jouables mises à jour : ${playableCardCodes.length} cartes. Codes: ${playableCardCodes.take(5).join(', ')}...';
-        _addDebugLog(message);
-        print(message); // Console log
+      final playableCards = gameLogic.getPlayableCards(
+        playerCards,
+        playerName,
+        gameLogic.currentTrick.isEmpty,
+      );
 
+      final playableCardCodes = playableCards.map((c) => c['code'] as String).toSet();
+
+      final message = '✅ Cartes jouables calculées localement : ${playableCardCodes.length} cartes. Codes: ${playableCardCodes.take(5).join(', ')}...';
+      _addDebugLog(message);
+      print(message); // Console log
+
+      if (mounted) {
         setState(() {
           _playableCardCodes = playableCardCodes;
           _playableCardsReady = true;
           _isUpdatingPlayableCards = false;
         });
-      } else {
-        final errorMsg = '❌ IDs non disponibles (gameId=$gameId, roundId=$roundId, trickId=$trickId, playerId=$playerId)';
-        _addDebugLog(errorMsg);
-        print(errorMsg);
-        setState(() {
-          _playableCardCodes.clear();
-          _playableCardsReady = false;
-          _isUpdatingPlayableCards = false;
-        });
       }
     } catch (e) {
-      final errorMsg = '❌ Erreur lors de la récupération des cartes jouables: $e';
+      final errorMsg = '❌ Erreur lors du calcul local des cartes jouables: $e';
       _addDebugLog(errorMsg);
       print(errorMsg); // Console log
       if (mounted) {
