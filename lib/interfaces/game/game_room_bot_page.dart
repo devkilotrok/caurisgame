@@ -2194,7 +2194,11 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
     handleAnnouncementTurnComplete();
   }
 
+  @override
   Future<void> onRoundCompleted() async {
+    if (isProcessingRoundCompletion) return;
+    isProcessingRoundCompletion = true;
+
     try {
       final players = gameSession.players
           .map((p) => p['name'] as String? ?? 'Joueur')
@@ -2399,57 +2403,6 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
         cardsPerPlayer: cardManager.cardsPerPlayer,
       );
 
-      // Synchroniser la distribution avec le backend (comme au round 1)
-      final roomId = gameSession.roomId ?? '';
-      if (roomId.isNotEmpty) {
-        try {
-          await GameApiService.instance.distributeCards(
-            roomId: roomId,
-            roundNumber: roundNumber,
-          );
-          print('✅ Round $roundNumber: cartes distribuées via backend');
-        } catch (e) {
-          print('⚠️ Round $roundNumber: distributeCards backend — $e');
-        }
-
-        try {
-          final orderedCodes = <String>[];
-          for (final name in playerNames) {
-            for (final c in cardManager.getPlayerCards(name)) {
-              orderedCodes.add((c['code'] as String?) ?? '');
-            }
-          }
-          final hash = crypto.sha256.convert(utf8.encode(orderedCodes.join('-'))).toString();
-          await GameApiService.instance.startRound(
-            roomId: roomId,
-            roundNumber: roundNumber,
-            deckHash: hash,
-          );
-        } catch (e) {
-          print('⚠️ Round $roundNumber: startRound backend — $e');
-        }
-      }
-
-      // Annonces automatiques des bots (identique au premier round)
-      for (final botName in playerNames) {
-        if (botName == widget.currentPlayerName) continue;
-        final computed = cardManager.getBotAnnouncement(botName);
-        cardManager.forceAnnouncement(botName, computed);
-        try {
-          final gameId = await getGameId();
-          if (gameId != null) {
-            await GameApiService.instance.makeAnnouncement(
-              gameId: gameId,
-              roundNumber: roundNumber,
-              announcementValue: computed,
-              playerName: botName,
-            );
-          }
-        } catch (e) {
-          print('⚠️ Annonce bot $botName (round $roundNumber) backend — $e');
-        }
-      }
-
       String firstPlayer = playerNames.first;
       final creator = gameSession.players.firstWhere(
         (p) => (p['isCreator'] as bool?) == true,
@@ -2460,8 +2413,61 @@ class _GameRoomBotPageState extends GameRoomBaseState<GameRoomBotPage> {
       }
       cardManager.currentPlayerTurn = firstPlayer;
 
-      if (!mounted) return;
-      setState(() {});
+      // ✅ Mettre à jour l'UI IMMÉDIATEMENT pour la nouvelle donne !
+      if (mounted) setState(() {});
+
+      // ✅ Synchroniser la distribution avec le backend EN ARRIÈRE-PLAN (ne pas bloquer l'UI)
+      Future(() async {
+        final roomId = gameSession.roomId ?? '';
+        if (roomId.isNotEmpty) {
+          try {
+            await GameApiService.instance.distributeCards(
+              roomId: roomId,
+              roundNumber: roundNumber,
+            );
+            print('✅ Round $roundNumber: cartes distribuées via backend');
+          } catch (e) {
+            print('⚠️ Round $roundNumber: distributeCards backend — $e');
+          }
+
+          try {
+            final orderedCodes = <String>[];
+            for (final name in playerNames) {
+              for (final c in cardManager.getPlayerCards(name)) {
+                orderedCodes.add((c['code'] as String?) ?? '');
+              }
+            }
+            final hash = crypto.sha256.convert(utf8.encode(orderedCodes.join('-'))).toString();
+            await GameApiService.instance.startRound(
+              roomId: roomId,
+              roundNumber: roundNumber,
+              deckHash: hash,
+            );
+          } catch (e) {
+            print('⚠️ Round $roundNumber: startRound backend — $e');
+          }
+        }
+
+        // Annonces automatiques des bots (identique au premier round)
+        for (final botName in playerNames) {
+          if (botName == widget.currentPlayerName) continue;
+          final computed = cardManager.getBotAnnouncement(botName);
+          cardManager.forceAnnouncement(botName, computed);
+          try {
+            final gameId = await getGameId();
+            if (gameId != null) {
+              await GameApiService.instance.makeAnnouncement(
+                gameId: gameId,
+                roundNumber: roundNumber,
+                announcementValue: computed,
+                playerName: botName,
+              );
+            }
+          } catch (e) {
+            print('⚠️ Annonce bot $botName (round $roundNumber) backend — $e');
+          }
+        }
+      });
 
       if (firstPlayer == widget.currentPlayerName) {
         startAnnouncementTimerForCurrentPlayer();
