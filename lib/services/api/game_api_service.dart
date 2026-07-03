@@ -57,7 +57,17 @@ class GameApiService {
     if (res.statusCode >= 200 && res.statusCode < 300) {
       return jsonDecode(res.body) as Map<String, dynamic>;
     }
-    throw Exception('Erreur joinRoom: ${res.statusCode} ${res.body}');
+    
+    // Essayer d'extraire un message clair de l'erreur du backend
+    String errorMessage = 'Erreur serveur (${res.statusCode})';
+    try {
+      final errorData = jsonDecode(res.body);
+      if (errorData['message'] != null) {
+        errorMessage = errorData['message'];
+      }
+    } catch (_) {}
+    
+    throw Exception(errorMessage);
   }
 
   Future<Map<String, dynamic>> fillBots({

@@ -93,7 +93,7 @@ class GameService {
       return false;
     } catch (e) {
       print('Erreur lors de la réunion de la salle: $e');
-      return false;
+      rethrow;
     }
   }
 
