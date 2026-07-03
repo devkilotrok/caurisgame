@@ -3875,19 +3875,6 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
         UserService.instance.currentUserPseudo ?? widget.currentPlayerName;
     int balance = 1000;
 
-    try {
-      final profile = await UserApiService.instance.getProfile();
-      if (profile['success'] == true) {
-        final user = profile['user'];
-        if (user is Map<String, dynamic>) {
-          pseudo = user['pseudo']?.toString() ?? pseudo;
-          balance = (user['cauris_balance'] as num?)?.toInt() ?? balance;
-        }
-      }
-    } catch (e) {
-      print('⚠️ Profil non rechargé avant retour dashboard: $e');
-    }
-
     if (!mounted) return;
 
     Navigator.of(context).pushAndRemoveUntil(

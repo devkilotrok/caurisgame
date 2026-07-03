@@ -10,7 +10,9 @@ import '../room/join_room_page.dart';
 import '../friends/friends_page.dart';
 import '../chat/chat_page.dart';
 
-class UserMenuPage extends StatelessWidget {
+import '../../services/api/user_api_service.dart';
+
+class UserMenuPage extends StatefulWidget {
   final String pseudo;
   final int caurisBalance;
   
@@ -19,6 +21,37 @@ class UserMenuPage extends StatelessWidget {
     this.pseudo = 'Alpha',
     this.caurisBalance = 1000,
   });
+
+  @override
+  State<UserMenuPage> createState() => _UserMenuPageState();
+}
+
+class _UserMenuPageState extends State<UserMenuPage> {
+  @override
+  void initState() {
+    super.initState();
+    // ✅ Initialiser le solde avec la valeur reçue si le Notifier est à 0
+    if (UserService.instance.caurisBalance.value == 0 && widget.caurisBalance > 0) {
+      UserService.instance.updateBalance(widget.caurisBalance);
+    }
+    // ✅ Mettre à jour le solde silencieusement en arrière-plan à chaque ouverture du menu
+    _refreshProfile();
+  }
+
+  Future<void> _refreshProfile() async {
+    try {
+      final profile = await UserApiService.instance.getProfile();
+      if (profile['success'] == true) {
+        final user = profile['user'];
+        if (user is Map<String, dynamic>) {
+          final balance = (user['cauris_balance'] as num?)?.toInt() ?? 0;
+          UserService.instance.updateBalance(balance);
+        }
+      }
+    } catch (e) {
+      print('⚠️ Erreur lors du rafraîchissement du solde en arrière-plan : $e');
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -100,8 +133,8 @@ class UserMenuPage extends StatelessWidget {
           context,
           MaterialPageRoute(
             builder: (context) => UserProfilePage(
-              pseudo: UserService.instance.currentUserPseudo ?? pseudo,
-              caurisBalance: caurisBalance,
+              pseudo: UserService.instance.currentUserPseudo ?? widget.pseudo,
+              caurisBalance: UserService.instance.caurisBalance.value,
               firstName: '',
               lastName: '',
               email: UserService.instance.currentUserEmail ?? '',
@@ -136,7 +169,7 @@ class UserMenuPage extends StatelessWidget {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
-                    pseudo,
+                    widget.pseudo,
                     style: const TextStyle(
                       color: Color(0xFFFFD700), // Jaune
                       fontSize: 16,
@@ -144,13 +177,18 @@ class UserMenuPage extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 2),
-                  Text(
-                    '$caurisBalance cauris',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.w500,
-                    ),
+                  ValueListenableBuilder<int>(
+                    valueListenable: UserService.instance.caurisBalance,
+                    builder: (context, balance, child) {
+                      return Text(
+                        '$balance cauris',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      );
+                    },
                   ),
                 ],
               ),
@@ -185,7 +223,7 @@ class UserMenuPage extends StatelessWidget {
                         Navigator.push(
                           context,
                           MaterialPageRoute(
-                            builder: (context) => CaissePage(caurisBalance: caurisBalance),
+                            builder: (context) => CaissePage(caurisBalance: UserService.instance.caurisBalance.value),
                           ),
                         );
                       },

@@ -23,6 +23,13 @@ class UserService {
   bool get isLoggedIn => _isLoggedIn;
   String? get authToken => _authToken; // ✅ Getter pour le token
 
+  // ✅ Notifier pour le solde (mise à jour en temps réel)
+  final ValueNotifier<int> caurisBalance = ValueNotifier<int>(0);
+
+  void updateBalance(int newBalance) {
+    caurisBalance.value = newBalance;
+  }
+
   /// Se connecter
   /// 
   /// TODO: INTÉGRER L'API BACKEND
