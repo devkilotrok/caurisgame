@@ -2844,7 +2844,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
               'code': cardCode,
               'suit': suitName,
               'value': valueName,
-              'image': 'assets/images/cards/${suitName.toLowerCase()}_$valueName.png',
+              'image': 'assets/images/cards/${suitName.toLowerCase()}_${cardValueShort == '0' ? '10' : cardValueShort}.png',
             };
             print('   Carte de bot construite depuis WebSocket: $cardCode');
           }
@@ -4675,23 +4675,22 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     // ✅ Vérifier si le joueur est déjà en train de jouer une carte (verrouillage de la main)
     final isPlayerPlaying = currentPlayerPlaying == widget.currentPlayerName;
 
-    // ✅ PRIORITÉ: Utiliser les cartes jouables du backend (source de vérité)
-    // Si le cache est vide, utiliser la logique locale comme fallback
+    // ✅ PRIORITÉ: Calcul local immédiat pour éviter toute latence UI due au réseau
     final cardCode = card['code'] as String? ?? '';
     bool isPlayable = false;
     
     if (isCurrentPlayerTurn &&
         !isAnnouncementPhase &&
-        !isPlayerPlaying &&
-        _playableCardsReady) {
-      isPlayable = _playableCardCodes.contains(cardCode.toUpperCase());
+        !isPlayerPlaying) {
+      // ✅ Calculer les cartes jouables localement pour une réactivité instantanée
+      gameLogic.syncCurrentTrick(cardManager.currentTrick);
+      final playableLocal = gameLogic.getPlayableCards(
+        playerCards,
+        widget.currentPlayerName,
+        cardManager.currentTrick.isEmpty,
+      );
+      isPlayable = playableLocal.any((c) => c['code'] == cardCode);
     }
-    
-    // ✅ Mettre à jour le cache des cartes jouables si nécessaire
-    // ⚠️ COMMENTÉ: Appel dans Future.microtask (closure) - problème de résolution du compilateur
-    // if (isCurrentPlayerTurn && !isAnnouncementPhase && !_isUpdatingPlayableCards) {
-    //   Future.microtask(() => this.updatePlayableCardsFromBackend());
-    // }
 
     final isAnimating = isAnimatingCard &&
         animatedCard != null &&
@@ -4709,8 +4708,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     final self = this;
     return GestureDetector(
       onTap: isPlayable ? () async {
-        if (!_playableCardsReady ||
-            !_playableCardCodes.contains(cardCode.toUpperCase())) {
+        // Validation locale instantanée
+        gameLogic.syncCurrentTrick(cardManager.currentTrick);
+        final playableLocal = gameLogic.getPlayableCards(
+          playerCards,
+          widget.currentPlayerName,
+          cardManager.currentTrick.isEmpty,
+        );
+        if (!playableLocal.any((c) => c['code'] == cardCode)) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text('Cette carte ($cardCode) n\'est plus jouable.'),
@@ -4718,11 +4723,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
               backgroundColor: Colors.orange,
             ),
           );
-          // ⚠️ COMMENTÉ: Appel dans onTap closure - problème de résolution du compilateur
-          // Mettre à jour le cache
-          // if (self.mounted) {
-          //   await self._updatePlayableCardsFromBackend();
-          // }
           return;
         }
         await playCard(card);
