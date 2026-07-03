@@ -3437,9 +3437,7 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     final String roomCode = gameSession.roomCode ?? '-----';
     final int minBet = gameSession.minimumBet ?? 0;
 
-    // Timer pour la fermeture automatique (sera annulé si l'utilisateur ferme manuellement)
-    Timer? autoCloseTimer;
-
+    // (Ancien Timer supprimé ici)
     return showDialog(
       context: context,
       barrierDismissible:
