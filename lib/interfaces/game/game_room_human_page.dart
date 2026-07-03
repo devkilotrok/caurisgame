@@ -3601,7 +3601,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     }
     
     // Démarrer la vérification
-    startCollectionAnimation();
+    await startCollectionAnimation();
 
     // 3. Après 1200ms (durée de l'animation), nettoyer le trick et passer au suivant
     // ✅ Remettre la durée d'animation à 1200ms pour une animation fluide
