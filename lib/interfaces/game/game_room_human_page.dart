@@ -3430,13 +3430,8 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
     if (isRoundComplete) {
       print('🎉 Dernier trick terminé ! Manche terminée.');
-      if (mounted) setState(() {});
-      Future.delayed(const Duration(milliseconds: 500), () {
-        if (mounted && !cardManager.isAnnouncementPhase) {
-          onRoundCompleted();
-        }
-      });
-      return;
+      // ⚠️ NE PAS RETOURNER ICI: Laisser _handleTrickEnd déclencher l'animation
+      // et appeler tryCompleteRoundIfFinished() pour la fin de manche !
     }
 
     if (mounted) {
