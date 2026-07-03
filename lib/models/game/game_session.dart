@@ -28,6 +28,7 @@ class GameSession {
   bool isGameCompleted = false;
   int currentRound = 0;
   bool playWithBots = false;
+  bool alreadyJoined = false;
   
   // Fonction pour initialiser une nouvelle session
   void initializeSession({
@@ -52,6 +53,7 @@ class GameSession {
     this.isGameCompleted = false;
     this.currentRound = 0;
     this.playWithBots = false;
+    this.alreadyJoined = false;
   }
   
   // Fonction pour ajouter le round actuel (sans incrémenter currentRound)

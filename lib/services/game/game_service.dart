@@ -78,6 +78,7 @@ class GameService {
       final code = (data['room_code'] ?? data['roomCode'] ?? roomCode) as String;
       final minBet = (data['minimum_bet'] ?? data['minimumBet'] ?? 0) as int;
       final players = (data['players'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+      final alreadyJoined = (data['already_joined'] ?? false) == true;
       if (roomId.isNotEmpty) {
         final backendRoomName = (data['room_name'] ?? roomName) as String;
         _gameSession.initializeSession(
@@ -87,6 +88,7 @@ class GameService {
           minimumBet: minBet,
           players: players,
         );
+        _gameSession.alreadyJoined = alreadyJoined;
         return true;
       }
 

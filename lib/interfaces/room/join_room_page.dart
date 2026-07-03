@@ -802,7 +802,8 @@ class _JoinRoomPageState extends State<JoinRoomPage> {
           session.playWithBots = false;
         }
         // Si partie avec humains, débiter la mise minimale du joueur qui rejoint
-        final bool shouldDebit = fromQuickJoin || (session.playWithBots == false);
+        // On ne débite PAS s'il était déjà dans la salle (reconnexion)
+        final bool shouldDebit = (fromQuickJoin || (session.playWithBots == false)) && !session.alreadyJoined;
         if (shouldDebit) {
           final roomId = int.tryParse(session.roomId ?? '') ?? 0;
           final minBet = session.minimumBet ?? 0;
@@ -914,8 +915,9 @@ class _JoinRoomPageState extends State<JoinRoomPage> {
         final roomName = invitation['roomName'] as String? ?? session.roomName ?? 'Room';
         final minimumBet = invitation['minimumBet'] as int? ?? session.minimumBet ?? 0;
         
-        // Si partie avec humains, débiter la mise minimale
-        if (session.playWithBots == false) {
+        // Si partie avec humains et pas déjà rejoint, débiter la mise minimale
+        final bool shouldDebit = (session.playWithBots == false) && !session.alreadyJoined;
+        if (shouldDebit) {
           final roomId = int.tryParse(session.roomId ?? '') ?? 0;
           final minBet = session.minimumBet ?? 0;
           if (roomId == 0 || minBet <= 0) {
