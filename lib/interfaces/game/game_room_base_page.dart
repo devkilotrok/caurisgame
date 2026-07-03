@@ -3414,6 +3414,18 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     Map<String, int> scores, {
     bool autoClose = false, // ✅ Par défaut, ne pas fermer automatiquement (joueur ouvre manuellement)
   }) {
+    // Timer pour la fermeture automatique (sera annulé si l'utilisateur ferme manuellement)
+    Timer? autoCloseTimer;
+
+    // ✅ Fermeture automatique après 5 secondes UNIQUEMENT si autoClose est true (fin de manche)
+    if (autoClose) {
+      autoCloseTimer = Timer(const Duration(seconds: 5), () {
+        if (mounted && Navigator.of(context).canPop()) {
+          Navigator.of(context).pop();
+        }
+      });
+    }
+
     // Somme = total des annonces (règle demandée)
     final int sommeAnnonces = players.fold(
       0,
@@ -3617,15 +3629,6 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
     ).then((_) {
       // ✅ Nettoyer le timer quand le dialog se ferme
       autoCloseTimer?.cancel();
-    }).whenComplete(() {
-      // ✅ Fermeture automatique après 5 secondes UNIQUEMENT si autoClose est true (fin de manche)
-      if (autoClose) {
-        autoCloseTimer = Timer(const Duration(seconds: 5), () {
-          if (mounted && Navigator.of(context).canPop()) {
-            Navigator.of(context).pop();
-          }
-        });
-      }
     });
   }
 
