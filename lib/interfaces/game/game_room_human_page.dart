@@ -6062,6 +6062,17 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       
       print('✅ Validation OK: gameId=$gameId, roundNumber=$roundNumber, announcementValue=$clampedAnnouncement');
       
+      // ✅ Mettre à jour l'état local IMMÉDIATEMENT pour cacher le panneau et éviter le double-clic
+      if (mounted) {
+        setState(() {
+          hasAnnounced = true;
+          currentAnnouncement = clampedAnnouncement;
+        });
+      } else {
+        hasAnnounced = true;
+        currentAnnouncement = clampedAnnouncement;
+      }
+
       // ✅ Envoyer l'annonce au backend (système simultané)
       final response = await GameApiService.instance.makeAnnouncement(
         gameId: gameId,
@@ -6088,15 +6099,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         );
       }
       
-      // ✅ Mettre à jour l'état local (l'annonce sera aussi reçue via WebSocket)
-      if (mounted) {
-        setState(() {
-          hasAnnounced = true;
-          currentAnnouncement = clampedAnnouncement;
-        });
-      } else {
-        hasAnnounced = true;
-        currentAnnouncement = clampedAnnouncement;
       }
       
       // ✅ Le backend enverra l'événement WebSocket announcement_submitted
@@ -6131,6 +6133,11 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       }
 
       if (mounted) {
+        // ✅ Réactiver le panneau si c'est une vraie erreur (pas phase close)
+        setState(() {
+          hasAnnounced = false;
+        });
+        
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Erreur annonce: ${e.toString().split('\n').first}'),
