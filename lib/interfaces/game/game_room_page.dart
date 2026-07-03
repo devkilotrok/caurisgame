@@ -2182,7 +2182,7 @@ class _GameRoomPageState extends State<GameRoomPage>
         alignment: alignment,
         child: Transform.translate(
           offset: position == 'top'
-              ? const Offset(0, -10) // Décaler vers le haut pour coller au bord
+              ? const Offset(0, -20) // Décaler vers le haut pour coller au bord
               : Offset.zero,
           child: Container(
             margin: _getPlayerMargin(position),
@@ -2512,6 +2512,7 @@ class _GameRoomPageState extends State<GameRoomPage>
   Widget _buildPlayerWidget(Map<String, dynamic> player) {
     return Column(
       mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         // Tag du nom avec fond marron foncé et coins arrondis stylisés
         Container(
@@ -2559,10 +2560,11 @@ class _GameRoomPageState extends State<GameRoomPage>
 
         // Stack avec cartes en éventail et avatar
         SizedBox(
-          width: 120,
+          width: 90,
           height: 100,
           child: Stack(
-            alignment: Alignment.center,
+            clipBehavior: Clip.none,
+            alignment: Alignment.centerLeft,
             children: [
               // Cartes en éventail derrière l'avatar
               ...List.generate(_getPlayerCardCount(player['name']), (index) {
@@ -2573,7 +2575,7 @@ class _GameRoomPageState extends State<GameRoomPage>
                     ? (index - (cardCount - 1) / 2) * 0.12
                     : 0.0; // Angle en radians, centré
                 final radius = 35.0; // Rayon de l'arc
-                final centerX = 60.0; // Centre horizontal
+                final centerX = 30.0; // Centre horizontal
                 final centerY = 50.0; // Centre vertical
 
                 // Position sur l'arc de cercle
@@ -2666,6 +2668,7 @@ class _GameRoomPageState extends State<GameRoomPage>
   Widget _buildPlayerWidgetRight(Map<String, dynamic> player) {
     return Column(
       mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
       children: [
         // Tag du nom avec fond marron foncé et coins arrondis stylisés
         Container(
@@ -2713,10 +2716,11 @@ class _GameRoomPageState extends State<GameRoomPage>
 
         // Stack avec cartes en éventail et avatar (orienté vers la gauche)
         SizedBox(
-          width: 120,
+          width: 90,
           height: 100,
           child: Stack(
-            alignment: Alignment.center,
+            clipBehavior: Clip.none,
+            alignment: Alignment.centerRight,
             children: [
               // Cartes en éventail derrière l'avatar (orienté vers la gauche)
               ...List.generate(_getPlayerCardCount(player['name']), (index) {
@@ -2818,23 +2822,40 @@ class _GameRoomPageState extends State<GameRoomPage>
   }
 
   Widget _buildPlayerWidgetTop(Map<String, dynamic> player) {
-    return Column(
+    return Row(
       mainAxisSize: MainAxisSize.min,
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        // Row avec Nom, compteur d'annonce et compteur de cristal (avec espace entre eux)
-        Row(
-          mainAxisSize: MainAxisSize.min,
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            // Conteneur pour le nom
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: const Color(0xFF8B4513), // Marron foncé
-                borderRadius: BorderRadius.circular(12),
+        // Conteneur pour le nom
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: const Color(0xFF8B4513),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 18,
+                height: 18,
+                decoration: BoxDecoration(
+                  color: Colors.yellow,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: const Center(
+                  child: Text(
+                    '♠',
+                    style: TextStyle(
+                      color: Colors.black,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
               ),
-              child: Text(
+              const SizedBox(width: 6),
+              Text(
                 player['name'],
                 style: const TextStyle(
                   color: Colors.white,
@@ -2842,89 +2863,30 @@ class _GameRoomPageState extends State<GameRoomPage>
                   fontWeight: FontWeight.bold,
                 ),
               ),
-            ),
-
-            const SizedBox(
-              width: 8,
-            ), // Espace entre le nom et le compteur d'annonce
-            // Conteneur pour le compteur d'annonce
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: const Color(0xFF8B4513), // Marron foncé
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Text(
-                _getPlayerAnnouncementDisplay(player['name']),
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-
-            const SizedBox(
-              width: 8,
-            ), // Espace entre le compteur d'annonce et le compteur de cristal
-            // Conteneur pour le compteur de points avec cristal
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: const Color(0xFF8B4513), // Marron foncé
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.diamond, color: Colors.blue, size: 16),
-                  const SizedBox(width: 4),
-                  Text(
-                    _getPlayerGlobalScore(player['name']).toString(),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
+            ],
+          ),
         ),
-
-        const SizedBox(
-          height: 8,
-        ), // Espace vertical entre le bloc nom/compteurs et l'avatar/éventail
-        // Stack avec cartes en éventail et avatar (en dessous du bloc nom/compteurs)
+        ),
+        const SizedBox(width: 4),
+        // Stack avec cartes en éventail et avatar
         SizedBox(
-          width: 150,
-          height: 120,
+          width: 60,
+          height: 100,
           child: Stack(
+            clipBehavior: Clip.none,
             alignment: Alignment.center,
             children: [
-              // Cartes en éventail derrière l'avatar (rotation 90°)
+              // Cartes en éventail derrière l'avatar
               ...List.generate(_getPlayerCardCount(player['name']), (index) {
                 final cardCount = _getPlayerCardCount(player['name']);
-                // Calculer l'angle pour l'effet éventail (centré)
-                // Si cardCount est 0, on ne génère aucune carte (List.generate avec 0)
                 final angle = cardCount > 0
                     ? (index - (cardCount - 1) / 2) * 0.12
-                    : 0.0; // Angle en radians, centré
-                final radius = 35.0; // Rayon de l'arc
-                final centerX = 75.0; // Centre horizontal (150/2)
-                final centerY = 60.0; // Centre vertical (120/2)
-
-                // Position sur l'arc de cercle avec rotation 90° horaire
-                final cardX =
-                    centerX -
-                    radius * math.sin(angle) -
-                    17.5; // -sin pour rotation 90° horaire
-                final cardY =
-                    centerY +
-                    radius * math.cos(angle) -
-                    25; // +cos pour rotation 90° horaire
-
+                    : 0.0;
+                final radius = 35.0;
+                final centerX = 30.0;
+                final centerY = 50.0;
+                final cardX = centerX - radius * math.sin(angle) - 17.5;
+                final cardY = centerY + radius * math.cos(angle) - 25;
                 return Positioned(
                   left: cardX,
                   top: cardY,
@@ -2942,6 +2904,47 @@ class _GameRoomPageState extends State<GameRoomPage>
                 child: Text(
                   player['avatar'],
                   style: const TextStyle(fontSize: 24),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 4),
+        // Conteneur pour le compteur d'annonce
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: const Color(0xFF8B4513),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Text(
+            _getPlayerAnnouncementDisplay(player['name']),
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        const SizedBox(width: 4),
+        // Conteneur pour le compteur de score avec diamant
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: const Color(0xFF8B4513),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.diamond, color: Colors.blue, size: 16),
+              const SizedBox(width: 4),
+              Text(
+                _getPlayerGlobalScore(player['name']).toString(),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
                 ),
               ),
             ],
@@ -3008,20 +3011,38 @@ class _GameRoomPageState extends State<GameRoomPage>
       left: 0,
       right: 0,
       child: Container(
-        height: 80,
-        child: Center(
-          child: SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: currentPlayerCards.map((card) {
-                return Container(
-                  margin: const EdgeInsets.symmetric(horizontal: 1),
+        height: 90, // Un peu de marge en hauteur pour l'animation
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final availableWidth = constraints.maxWidth;
+            final cardWidth = 55.0;
+            final numCards = currentPlayerCards.length;
+
+            if (numCards == 0) return const SizedBox.shrink();
+
+            double step = cardWidth + 2.0; // Espacement par défaut
+            if (numCards > 1) {
+              final maxStep = (availableWidth - cardWidth - 20) / (numCards - 1);
+              if (maxStep < step) {
+                step = maxStep; // On compresse si ça ne rentre pas
+              }
+            }
+
+            final totalWidth = (numCards - 1) * step + cardWidth;
+            final startX = (availableWidth - totalWidth) / 2;
+
+            return Stack(
+              clipBehavior: Clip.none,
+              children: List.generate(numCards, (index) {
+                final card = currentPlayerCards[index];
+                return Positioned(
+                  left: startX + index * step,
+                  bottom: 0,
                   child: _buildHandCard(card),
                 );
-              }).toList(),
-            ),
-          ),
+              }),
+            );
+          },
         ),
       ),
     );
@@ -3277,12 +3298,15 @@ class _GameRoomPageState extends State<GameRoomPage>
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  const Text(
-                    'Combien de plis gagnerez-vous ?',
-                    style: TextStyle(
-                      color: Colors.black,
-                      fontSize: 14,
-                      fontWeight: FontWeight.bold,
+                  Expanded(
+                    child: Text(
+                      'Combien de plis gagnerez-vous ?',
+                      style: const TextStyle(
+                        color: Colors.black,
+                        fontSize: 14,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ),
                   Container(
@@ -3533,7 +3557,7 @@ class _GameRoomPageState extends State<GameRoomPage>
       children: [
         // Bouton liste (haut gauche)
         Positioned(
-          top: 20,
+          top: 0,
           left: 20,
           child: _buildControlButton(
             icon: Icons.list,
@@ -3545,7 +3569,7 @@ class _GameRoomPageState extends State<GameRoomPage>
 
         // Bouton paramètres (haut droite)
         Positioned(
-          top: 20,
+          top: 0,
           right: 20,
           child: _buildControlButton(
             icon: Icons.settings,
@@ -3599,9 +3623,12 @@ class _GameRoomPageState extends State<GameRoomPage>
   }
 
   Widget _buildRoomInfo() {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final isSmallScreen = screenWidth < 600;
+
     return Positioned(
-      top: 20,
-      left: 80, // Collé au menu (menu fait ~50px + marge)
+      top: isSmallScreen ? 60 : 0,
+      left: isSmallScreen ? 20 : 80,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
@@ -3609,6 +3636,7 @@ class _GameRoomPageState extends State<GameRoomPage>
           borderRadius: BorderRadius.circular(15),
         ),
         child: Column(
+          crossAxisAlignment: isSmallScreen ? CrossAxisAlignment.start : CrossAxisAlignment.center,
           children: [
             Text(
               widget.roomName,
@@ -3619,7 +3647,11 @@ class _GameRoomPageState extends State<GameRoomPage>
               ),
             ),
             Text(
-              'Code: ${widget.roomCode} • Mise: ${widget.minimumBet} cauris',
+              'Code: ${widget.roomCode}',
+              style: const TextStyle(color: Colors.grey, fontSize: 10),
+            ),
+            Text(
+              'Mise: ${widget.minimumBet} cauris',
               style: const TextStyle(color: Colors.grey, fontSize: 10),
             ),
           ],
