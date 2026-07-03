@@ -532,6 +532,12 @@ class LocalCardManager {
 
   /// Remplace ou ajoute les annonces locales avec les valeurs du backend (ex. +1 si total < 10).
   void syncAnnouncementsFromBackend(Map<String, dynamic> announcements) {
+    // ✅ Supprimer les annonces locales qui n'existent pas dans le backend (source de vérité)
+    final backendPlayerNames = announcements.keys.map((k) => k.toString()).toSet();
+    _currentRoundAnnouncements.removeWhere(
+      (ann) => !backendPlayerNames.contains(ann['player']),
+    );
+
     for (final entry in announcements.entries) {
       final playerName = entry.key.toString();
       final value = ((entry.value as num?)?.toInt() ?? 2).clamp(2, 13);

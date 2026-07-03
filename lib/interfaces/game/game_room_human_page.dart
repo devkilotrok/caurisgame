@@ -435,15 +435,18 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         roundNumber: _effectiveRoundNumber(),
       );
 
-      if (turnData['all_announced'] != true) {
-        print('ℹ️ Secours annonces ($reason): BDD pas encore complète');
-        return;
-      }
-
       final announcementsRaw = turnData['announcements'];
       Map<String, dynamic>? announcementsMap;
       if (announcementsRaw is Map) {
         announcementsMap = Map<String, dynamic>.from(announcementsRaw);
+        // ✅ Synchroniser immédiatement pour corriger tout déséquilibre local (ex: erreur réseau)
+        syncAnnouncementsFromBackendMap(announcementsMap);
+      }
+
+      if (turnData['all_announced'] != true) {
+        print('ℹ️ Secours annonces ($reason): BDD pas encore complète');
+        if (mounted) setState(() {});
+        return;
       }
 
       await _completeAnnouncementPhaseFromBackend(

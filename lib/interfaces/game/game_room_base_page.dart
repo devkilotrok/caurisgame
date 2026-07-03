@@ -2897,39 +2897,41 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
       final gameId = await getGameId();
       final localTotalBefore = announcementsMap.values.fold<int>(0, (a, b) => a + b);
 
-      try {
-        if (roundId != null) {
-          await GameApiService.instance.validateAnnouncements(
-            roundId: roundId,
-            announcements: announcementsMap,
-          );
-          print('✅ Annonces validées par le backend');
-
-          if (gameId != null) {
-            final turnData = await GameApiService.instance.getAnnouncementTurn(
-              gameId: gameId,
-              roundNumber: _effectiveRoundNumber(),
+      if (!fromBackend) {
+        try {
+          if (roundId != null) {
+            await GameApiService.instance.validateAnnouncements(
+              roundId: roundId,
+              announcements: announcementsMap,
             );
-            final backendRaw = turnData['announcements'];
-            if (backendRaw is Map && backendRaw.isNotEmpty) {
-              shouldShowAdjustmentMessage = syncAnnouncementsFromBackendMap(
-                Map<String, dynamic>.from(backendRaw),
+            print('✅ Annonces validées par le backend');
+
+            if (gameId != null) {
+              final turnData = await GameApiService.instance.getAnnouncementTurn(
+                gameId: gameId,
+                roundNumber: _effectiveRoundNumber(),
               );
-              registerScoreboardFromSyncedAnnouncements();
+              final backendRaw = turnData['announcements'];
+              if (backendRaw is Map && backendRaw.isNotEmpty) {
+                shouldShowAdjustmentMessage = syncAnnouncementsFromBackendMap(
+                  Map<String, dynamic>.from(backendRaw),
+                );
+                registerScoreboardFromSyncedAnnouncements();
+              }
             }
+          } else {
+            print('⚠️ round_id non disponible, validation locale');
+            final validationResult = gameLogic.validateAnnouncements(announcements);
+            needsLocalIncrement = validationResult['needsNewBids'] == true;
           }
-        } else {
-          print('⚠️ round_id non disponible, validation locale');
-          final validationResult = gameLogic.validateAnnouncements(announcements);
-          needsLocalIncrement = validationResult['needsNewBids'] == true;
-        }
-      } catch (e) {
-        print('⚠️ Erreur validation/sync annonces backend: $e');
-        if (roundId == null) {
-          final validationResult = gameLogic.validateAnnouncements(announcements);
-          needsLocalIncrement = validationResult['needsNewBids'] == true;
-        } else if (localTotalBefore < 10) {
-          shouldShowAdjustmentMessage = true;
+        } catch (e) {
+          print('⚠️ Erreur validation/sync annonces backend: $e');
+          if (roundId == null) {
+            final validationResult = gameLogic.validateAnnouncements(announcements);
+            needsLocalIncrement = validationResult['needsNewBids'] == true;
+          } else if (localTotalBefore < 10) {
+            shouldShowAdjustmentMessage = true;
+          }
         }
       }
 
