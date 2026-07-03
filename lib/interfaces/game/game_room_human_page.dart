@@ -2980,7 +2980,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     // au lieu de faire 4 appels réseau qui ralentissaient considérablement l'affichage.
     
     final playerName = widget.currentPlayerName;
-    if (playerName.isEmpty || !isCurrentPlayerTurn) {
+    if (playerName.isEmpty || playerName != cardManager.currentPlayerTurn) {
       if (mounted) {
         setState(() {
           _playableCardCodes.clear();
