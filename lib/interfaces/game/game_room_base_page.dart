@@ -2042,6 +2042,17 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
 
     print('⏱️ Démarrage du timer de 15 secondes pour $currentPlayer');
     
+    // ✅ AUTO-PLAY DU DERNIER PLI: Si le joueur n'a plus qu'une seule carte, on la joue instantanément
+    final playerCards = cardManager.getPlayerCards(currentPlayer);
+    if (playerCards.length == 1) {
+      print('🚀 AUTO-PLAY: Plus qu\'une seule carte pour $currentPlayer, jeu automatique immédiat !');
+      // Léger délai pour laisser le temps à l'UI de respirer avant l'animation
+      Future.delayed(const Duration(milliseconds: 300), () {
+        _playHighestPlayableCard(currentPlayer);
+      });
+      return;
+    }
+    
     _playerTurnTimeoutTimer = Timer(const Duration(seconds: 15), () {
       if (!mounted || cardManager.isAnnouncementPhase) {
         return;
@@ -2514,9 +2525,14 @@ abstract class GameRoomBaseState<T extends GameRoomBasePage>
         }
       } else {
         // ⚠️ PARTIE CONTINUE - Démarrer automatiquement une nouvelle manche dans le MÊME salon
-        Future.delayed(const Duration(milliseconds: 400), () async {
-          await startNewRound();
-        });
+        // ✅ En mode multi, c'est le listener WebSocket (round_completed_broadcast) qui s'en charge
+        if (gameSession.playWithBots) {
+          Future.delayed(const Duration(milliseconds: 400), () async {
+            await startNewRound();
+          });
+        } else {
+          print('⏳ En attente de round_completed_broadcast pour démarrer la nouvelle manche');
+        }
       }
     } catch (e, st) {
       print('❌ Erreur calcul score: $e');

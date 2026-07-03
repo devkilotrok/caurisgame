@@ -1828,6 +1828,29 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     }
   }
 
+  // ✅ Surcharger tryCompleteRoundIfFinished pour que SEUL le créateur enregistre le round
+  @override
+  Future<void> tryCompleteRoundIfFinished() async {
+    // Vérifier si nous sommes le créateur du salon
+    final isCreator = gameSession.players.any(
+      (p) => (p['name'] as String?) == widget.currentPlayerName &&
+          (p['isCreator'] as bool?) == true,
+    );
+
+    if (isCreator) {
+      if (isProcessingRoundCompletion) return;
+      isProcessingRoundCompletion = true;
+      try {
+        await super.tryCompleteRoundIfFinished();
+      } finally {
+        // En mode multiplayer, c'est réinitialisé lors du démarrage de la nouvelle manche
+      }
+    } else {
+      print('⏳ En attente du créateur pour finaliser la manche...');
+      // Les autres joueurs ne font rien, ils attendent le round_completed_broadcast
+    }
+  }
+
   // Surcharger sendRoundCompletedViaWebSocket pour envoyer via WebSocket
   @override
   void sendRoundCompletedViaWebSocket(
