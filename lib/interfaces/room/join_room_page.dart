@@ -185,22 +185,9 @@ class _JoinRoomPageState extends State<JoinRoomPage> {
             ),
           ),
           const SizedBox(width: 16),
-          FutureBuilder<int>(
-            future: _getUserBalance(),
-            builder: (context, snapshot) {
-              if (snapshot.connectionState == ConnectionState.waiting) {
-                return SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(
-                      isDark ? Colors.white : Colors.black,
-                    ),
-                  ),
-                );
-              }
-              final balance = snapshot.data ?? 0;
+          ValueListenableBuilder<int>(
+            valueListenable: UserService.instance.caurisBalance,
+            builder: (context, balance, child) {
               return Text(
                 'Solde: $balance cauris',
                 style: TextStyle(

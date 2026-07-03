@@ -168,10 +168,9 @@ class _CreateRoomPageState extends State<CreateRoomPage> {
                   ),
                 ),
                 const SizedBox(height: 8),
-                FutureBuilder<Map<String, dynamic>>(
-                  future: PaymentApiService.instance.getBalance(),
-                  builder: (context, snapshot) {
-                    final balance = snapshot.data?['balance'] ?? 0;
+                ValueListenableBuilder<int>(
+                  valueListenable: UserService.instance.caurisBalance,
+                  builder: (context, balance, child) {
                     return Row(
                       children: [
                         const Icon(
