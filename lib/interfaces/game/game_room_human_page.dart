@@ -6099,8 +6099,6 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         );
       }
       
-      }
-      
       // ✅ Le backend enverra l'événement WebSocket announcement_submitted
       // qui sera traité par le listener
       
