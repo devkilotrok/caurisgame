@@ -3136,9 +3136,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       if (backendTrickNum != null && backendTrickNum > currentTrickNum) {
         print('🩹 Watchdog: le backend a déjà progressé au pli $backendTrickNum. Validation forcée du pli $currentTrickNum.');
         // Le gagnant du pli précédent est celui qui a le tour actuel
-        final fallbackWinner = (winnerName?.isNotEmpty == true) ? winnerName : cardManager.currentPlayerTurn;
+        final fallbackWinner = (winnerName != null && winnerName.isNotEmpty) ? winnerName : cardManager.currentPlayerTurn;
         
-        if (fallbackWinner.isNotEmpty) {
+        if (fallbackWinner != null && fallbackWinner.isNotEmpty) {
           await _onTrickCompletedFromWebSocket({
             'roomId': roomId,
             'winner_name': fallbackWinner,
