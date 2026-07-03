@@ -2655,9 +2655,18 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       if (isCollectingTrick ||
           cardManager.currentTrick.length >= cardManager.expectedPlayerCount) {
         print(
-          'ℹ️ turn_changed ignoré: pli complet ou collecte en cours '
-          '(${cardManager.currentTrick.length}/${cardManager.expectedPlayerCount})',
+          'ℹ️ turn_changed reçu pendant un pli complet ou collecte en cours '
+          '(${cardManager.currentTrick.length}/${cardManager.expectedPlayerCount}). '
+          'Utilisé pour accélérer le watchdog.',
         );
+        
+        // Mettre à jour le tour car c'est le gagnant du pli précédent
+        if (currentPlayerName != null && currentPlayerName.isNotEmpty) {
+          cardManager.currentPlayerTurn = currentPlayerName;
+        }
+        
+        // Déclencher le watchdog immédiatement au lieu d'attendre 4s
+        unawaited(_recoverTrickCompletionFromBackend());
         return;
       }
       
@@ -3091,7 +3100,12 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         trickNumber: currentTrickNum.clamp(1, 13),
       );
 
-      if (trickData['success'] != true) return;
+      print('🩹 Watchdog réponse API: $trickData');
+
+      if (trickData['success'] != true) {
+        print('⚠️ Watchdog: Echec API: success != true');
+        return;
+      }
 
       final rawData = trickData['data'];
       if (rawData is! Map) return;
@@ -3100,20 +3114,41 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
       final status = data['trick_status'] as String? ?? 'in_progress';
       final winnerName = data['winner_name'] as String?;
       final cardsInTrick = (data['cards_in_trick'] as num?)?.toInt() ?? 0;
+      final backendTrickNum = (data['current_trick_number'] as num?)?.toInt() ?? 
+                              (data['trick_number'] as num?)?.toInt();
 
-      if (status == 'completed' &&
-          winnerName != null &&
-          winnerName.isNotEmpty &&
-          cardsInTrick >= expected) {
+      print('🩹 Watchdog: status=$status, winnerName=$winnerName, cardsInTrick=$cardsInTrick, backendTrickNum=$backendTrickNum, expected=$expected');
+
+      // ✅ Cas 1: Le backend répond explicitement que ce pli est complété
+      if (status == 'completed' && winnerName != null && winnerName.isNotEmpty) {
         await _onTrickCompletedFromWebSocket({
           'roomId': roomId,
           'winner_name': winnerName,
           'current_trick_number': currentTrickNum,
-          'next_trick_number': data['next_trick_number'],
+          'next_trick_number': data['next_trick_number'] ?? backendTrickNum,
           'obtained_tricks': data['obtained_tricks'],
           'trick_cards': data['played_cards'],
         });
         return;
+      }
+
+      // ✅ Cas 2: Le backend est déjà passé au pli suivant (ex: backendTrickNum = 2, on attendait 1)
+      if (backendTrickNum != null && backendTrickNum > currentTrickNum) {
+        print('🩹 Watchdog: le backend a déjà progressé au pli $backendTrickNum. Validation forcée du pli $currentTrickNum.');
+        // Le gagnant du pli précédent est celui qui a le tour actuel
+        final fallbackWinner = (winnerName?.isNotEmpty == true) ? winnerName : cardManager.currentPlayerTurn;
+        
+        if (fallbackWinner.isNotEmpty) {
+          await _onTrickCompletedFromWebSocket({
+            'roomId': roomId,
+            'winner_name': fallbackWinner,
+            'current_trick_number': currentTrickNum,
+            'next_trick_number': backendTrickNum,
+            'obtained_tricks': data['obtained_tricks'],
+            'trick_cards': data['played_cards'], // Peut être vide, on s'appuiera sur les cartes locales
+          });
+          return;
+        }
       }
 
       if (cardsInTrick >= expected && status != 'completed') {
