@@ -1830,7 +1830,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
   // ✅ Surcharger tryCompleteRoundIfFinished pour que SEUL le créateur enregistre le round
   @override
-  Future<void> tryCompleteRoundIfFinished() async {
+  void tryCompleteRoundIfFinished() {
     // Vérifier si nous sommes le créateur du salon
     final isCreator = gameSession.players.any(
       (p) => (p['name'] as String?) == widget.currentPlayerName &&
@@ -1838,13 +1838,7 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
     );
 
     if (isCreator) {
-      if (isProcessingRoundCompletion) return;
-      isProcessingRoundCompletion = true;
-      try {
-        await super.tryCompleteRoundIfFinished();
-      } finally {
-        // En mode multiplayer, c'est réinitialisé lors du démarrage de la nouvelle manche
-      }
+      super.tryCompleteRoundIfFinished();
     } else {
       print('⏳ En attente du créateur pour finaliser la manche...');
       // Les autres joueurs ne font rien, ils attendent le round_completed_broadcast
