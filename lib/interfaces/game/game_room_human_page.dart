@@ -6307,9 +6307,9 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
         });
       }
       
-      // ✅ CORRECTION: Si le temps est écoulé, vérifier que tous les joueurs ont annoncé
-      // Si certains n'ont pas annoncé, leur assigner automatiquement 2 plis
-      if (remaining <= 0) {
+      // ✅ CORRECTION: Anticiper le timeout de 2 secondes pour compenser la latence réseau
+      // Si le temps restant est <= 2 secondes, on lance l'assignation automatique (optimisation)
+      if (remaining <= 2) {
         _announcementPhaseTimer?.cancel();
         
         // ✅ Vérifier que tous les joueurs ont fait leur annonce (de manière asynchrone)
