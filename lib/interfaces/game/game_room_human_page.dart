@@ -3196,9 +3196,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
           final data = Map<String, dynamic>.from(rawData);
           final backendTrickNumber = (data['trick_number'] as num?)?.toInt();
           if (backendTrickNumber != null) {
-            _activeBackendTrickNumber = backendTrickNumber;
-            if (backendTrickNumber != cardManager.currentTrickNumber) {
-              cardManager.setCurrentTrickNumber(backendTrickNumber);
+            // ✅ NE JAMAIS RÉTROGRADER LE NUMÉRO DE PLI (protection contre requêtes HTTP lentes)
+            if (_activeBackendTrickNumber == null || backendTrickNumber >= _activeBackendTrickNumber!) {
+              _activeBackendTrickNumber = backendTrickNumber;
+              if (backendTrickNumber != cardManager.currentTrickNumber) {
+                cardManager.setCurrentTrickNumber(backendTrickNumber);
+              }
+            } else {
+              print('⚠️ Rétrogradation bloquée (getTrickId): API retourne pli #$backendTrickNumber mais actif = $_activeBackendTrickNumber');
             }
           }
           return data['trick_id'] as int?;
@@ -3267,9 +3272,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
 
       final backendTrickNumber = (data['trick_number'] as num?)?.toInt();
       if (backendTrickNumber != null) {
-        _activeBackendTrickNumber = backendTrickNumber;
-        if (backendTrickNumber != cardManager.currentTrickNumber) {
-          cardManager.setCurrentTrickNumber(backendTrickNumber);
+        // ✅ NE JAMAIS RÉTROGRADER LE NUMÉRO DE PLI (protection contre requêtes HTTP lentes)
+        if (_activeBackendTrickNumber == null || backendTrickNumber >= _activeBackendTrickNumber!) {
+          _activeBackendTrickNumber = backendTrickNumber;
+          if (backendTrickNumber != cardManager.currentTrickNumber) {
+            cardManager.setCurrentTrickNumber(backendTrickNumber);
+          }
+        } else {
+          print('⚠️ Rétrogradation bloquée (resync): API retourne pli #$backendTrickNumber mais actif = $_activeBackendTrickNumber');
         }
       }
 
@@ -5401,6 +5411,14 @@ class _GameRoomHumanPageState extends GameRoomBaseState<GameRoomHumanPage> {
                 final cardCode = card['code'] as String?;
                 if (card.isEmpty || cardCode == null || cardCode.isEmpty) {
                   print('⚠️ _buildCenterTrick: Carte invalide pour $playerName à l\'index $index');
+                  return const SizedBox.shrink();
+                }
+
+                // ✅ Ne pas afficher la carte au centre si elle est en train d'être animée depuis la main
+                if (isAnimatingCard && 
+                    animatedCard != null && 
+                    animatedCard!['code'] == cardCode && 
+                    animatingPlayerName == playerName) {
                   return const SizedBox.shrink();
                 }
                 
